@@ -1,12 +1,12 @@
 [project]
 name = "mmwave_radar_devtool"
 version = "0.1.0"
-description = "Python toolkit for TI mmWave radar development with the IWR1843 and DCA1000EVM"
+description = "Python toolkit for TI mmWave radar development with TI CLI devices and DCA1000EVM"
 readme = "README.md"
 requires-python = ">=3.14"
 license = {file = "LICENSE"}
 authors = [{name = "SergiMuac"}]
-keywords = ["mmwave", "radar", "iwr1843", "dca1000", "ti"]
+keywords = ["mmwave", "radar", "iwr1843", "iwr6843", "dca1000", "ti"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

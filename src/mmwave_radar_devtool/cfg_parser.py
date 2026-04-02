@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import DCA1000DataLoggingMode
 from .exceptions import ConfigurationError
 
 
@@ -19,7 +18,7 @@ class RadarCliLine:
 
 @dataclass(slots=True, frozen=True)
 class AdcCfg:
-    """Decoded adcCfg settings relevant for DCA1000 capture."""
+    """Decoded adcCfg settings relevant for raw capture."""
 
     num_adc_bits_code: int
     adc_output_format_code: int
@@ -37,19 +36,12 @@ class AdcCfg:
 
 @dataclass(slots=True, frozen=True)
 class LvdsStreamCfg:
-    """Decoded lvdsStreamCfg settings relevant for DCA1000 capture."""
+    """Decoded lvdsStreamCfg settings relevant for raw LVDS capture."""
 
     subframe_idx: int
     enable_header: bool
     enable_hw_stream: bool
     enable_sw_stream: bool
-
-    @property
-    def data_logging_mode(self) -> DCA1000DataLoggingMode:
-        """Return the required DCA1000 logging mode for this LVDS setup."""
-        if self.enable_header:
-            return DCA1000DataLoggingMode.MULTI
-        return DCA1000DataLoggingMode.RAW
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,20 +59,15 @@ class ProfileCfg:
 
 @dataclass(slots=True, frozen=True)
 class RadarCaptureRequirements:
-    """Capture settings derived from the radar cfg."""
+    """Generic raw-capture settings derived from the radar cfg."""
 
     adc_cfg: AdcCfg
     lvds_stream_cfg: LvdsStreamCfg
 
     @property
-    def data_format_mode(self) -> int:
-        """Return the DCA1000 data format mode value."""
-        return self.adc_cfg.data_format_mode
-
-    @property
-    def data_logging_mode(self) -> DCA1000DataLoggingMode:
-        """Return the DCA1000 data logging mode value."""
-        return self.lvds_stream_cfg.data_logging_mode
+    def requires_complex_adc(self) -> bool:
+        """Return whether the current raw decoder expects complex IQ samples."""
+        return True
 
 
 @dataclass(slots=True, frozen=True)
@@ -199,8 +186,8 @@ class RadarCliConfig:
             enable_sw_stream=enable_sw_stream,
         )
 
-    def validate_for_dca_capture(self) -> RadarCaptureRequirements:
-        """Validate that the cfg enables LVDS capture for DCA1000."""
+    def extract_capture_requirements(self) -> RadarCaptureRequirements:
+        """Extract generic raw-capture requirements from the cfg."""
         adc_cfg = self.parse_adc_cfg()
         lvds_cfg = self.parse_lvds_stream_cfg()
 

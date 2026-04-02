@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from .capture import CaptureOrchestrator
-from .cfg_parser import create_capture_cfg, parse_radar_cfg
-from .config import CaptureConfig, DCA1000Config, RadarSerialConfig
+from .cfg_parser import RadarCliConfig, create_capture_cfg, parse_radar_cfg
+from .config import CaptureConfig, DCA1000Config, RadarDataSerialConfig, RadarSerialConfig
+from .profiles import get_profile, list_profile_names, list_profiles
 from .visualize import plot_raw_iq
 
 
@@ -19,6 +21,13 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--radar-cli-port", required=True)
     common.add_argument("--cfg", required=True)
+    common.add_argument(
+        "--profile",
+        default="generic-ti-dca1000",
+        choices=list_profile_names(),
+    )
+    common.add_argument("--radar-data-port")
+    common.add_argument("--radar-data-baudrate", type=int, default=921600)
     common.add_argument("--fpga-ip", default="192.168.33.180")
     common.add_argument("--host-ip", default="192.168.33.30")
     common.add_argument("--config-port", type=int, default=4096)
@@ -31,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe_parser = subparsers.add_parser("probe", parents=[common])
     probe_parser.set_defaults(handler=_handle_probe)
+
+    profiles_parser = subparsers.add_parser("profiles")
+    profiles_parser.set_defaults(handler=_handle_profiles)
 
     capture_parser = subparsers.add_parser("capture", parents=[common])
     capture_parser.add_argument("--output", required=True)
@@ -60,8 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_runtime(args: argparse.Namespace) -> tuple[CaptureOrchestrator, object]:
+def _build_runtime(args: argparse.Namespace) -> tuple[CaptureOrchestrator, RadarCliConfig]:
     """Build shared runtime objects for CLI commands."""
+    profile = get_profile(args.profile)
     dca_config = DCA1000Config(
         fpga_ip=args.fpga_ip,
         host_ip=args.host_ip,
@@ -76,7 +89,18 @@ def _build_runtime(args: argparse.Namespace) -> tuple[CaptureOrchestrator, objec
         debug_serial=args.debug_serial,
         verbose=args.verbose,
     )
-    orchestrator = CaptureOrchestrator(dca_config=dca_config, serial_config=serial_config)
+    data_serial_config = None
+    if args.radar_data_port:
+        data_serial_config = RadarDataSerialConfig(
+            data_port=args.radar_data_port,
+            data_baudrate=args.radar_data_baudrate,
+        )
+    orchestrator = CaptureOrchestrator(
+        dca_config=dca_config,
+        serial_config=serial_config,
+        profile=profile,
+        data_serial_config=data_serial_config,
+    )
     cfg = parse_radar_cfg(Path(args.cfg))
     return orchestrator, cfg
 
@@ -87,6 +111,20 @@ def _handle_probe(args: argparse.Namespace) -> int:
     result = orchestrator.probe(cfg=cfg)
     for key, value in result.items():
         print(f"{key}: {value}")
+    return 0
+
+
+def _handle_profiles(args: argparse.Namespace) -> int:
+    """Print supported profiles and their capabilities."""
+    del args
+    for profile in list_profiles():
+        print(f"{profile.name}: {profile.display_name}")
+        print(f"  control_backend={profile.control_backend}")
+        print(f"  data_backend={profile.data_backend}")
+        print(f"  supports_raw_capture={profile.supports_raw_capture}")
+        print(f"  supports_usb_telemetry={profile.supports_usb_telemetry}")
+        print(f"  default_cfg={profile.default_cfg_path}")
+        print(f"  description={profile.description}")
     return 0
 
 
@@ -142,13 +180,13 @@ def _handle_make_capture_cfg(args: argparse.Namespace) -> int:
 
 def _print_stats(stats: object) -> None:
     """Print capture statistics."""
-    print(f"packets_received={stats.packets_received}")
-    print(f"bytes_received={stats.bytes_received}")
-    print(f"payload_bytes_written={stats.payload_bytes_written}")
-    print(f"elapsed_s={stats.elapsed_s:.3f}")
-    print(f"first_sequence_number={stats.first_sequence_number}")
-    print(f"last_sequence_number={stats.last_sequence_number}")
-    print(f"sequence_gaps_detected={stats.sequence_gaps_detected}")
+    if not is_dataclass(stats):
+        raise TypeError("Statistics object must be a dataclass instance")
+    for key, value in asdict(stats).items():
+        if isinstance(value, float):
+            print(f"{key}={value:.3f}")
+        else:
+            print(f"{key}={value}")
 
 
 def main() -> int:

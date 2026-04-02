@@ -7,6 +7,7 @@ import struct
 from dataclasses import dataclass
 from enum import IntEnum
 
+from .cfg_parser import RadarCaptureRequirements
 from .config import DCA1000Config, DCA1000DataLoggingMode
 from .exceptions import DCA1000ResponseError
 
@@ -58,6 +59,27 @@ class DCA1000DataPacket:
         byte_count = int.from_bytes(datagram[4:10], byteorder="little", signed=False)
         payload = datagram[10:]
         return cls(sequence_number=sequence_number, byte_count=byte_count, payload=payload)
+
+
+@dataclass(slots=True, frozen=True)
+class DCA1000CaptureSettings:
+    """DCA1000-specific settings derived from generic capture requirements."""
+
+    data_logging_mode: DCA1000DataLoggingMode
+    data_format_mode: int
+
+
+def map_capture_requirements(requirements: RadarCaptureRequirements) -> DCA1000CaptureSettings:
+    """Translate generic TI raw-capture requirements into DCA1000 settings."""
+    data_logging_mode = (
+        DCA1000DataLoggingMode.MULTI
+        if requirements.lvds_stream_cfg.enable_header
+        else DCA1000DataLoggingMode.RAW
+    )
+    return DCA1000CaptureSettings(
+        data_logging_mode=data_logging_mode,
+        data_format_mode=requirements.adc_cfg.data_format_mode,
+    )
 
 
 class DCA1000Client:

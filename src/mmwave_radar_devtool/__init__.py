@@ -7,6 +7,9 @@ __all__ = [
     "dca1000",
     "exceptions",
     "parser",
+    "profiles",
     "serial_control",
+    "telemetry_live",
+    "usb_telemetry",
     "visualize",
 ]

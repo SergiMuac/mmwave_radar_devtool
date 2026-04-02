@@ -180,7 +180,7 @@ class TerminalLiveDashboard:
     """Rich terminal dashboard for live radar telemetry and simple plots."""
 
     def __init__(
-        self, radar_cfg: RadarCliConfig | None = None, title: str = "IWR1843 • DCA1000 Live"
+        self, radar_cfg: RadarCliConfig | None = None, title: str = "TI mmWave + DCA1000 Live"
     ) -> None:
         """Initialize the dashboard."""
         self._title = title

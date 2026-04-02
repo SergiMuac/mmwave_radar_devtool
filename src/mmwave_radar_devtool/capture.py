@@ -9,10 +9,14 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .cfg_parser import RadarCliConfig
-from .config import CaptureConfig, DCA1000Config, RadarSerialConfig
-from .dca1000 import DCA1000Client, DCA1000DataPacket
+from .config import CaptureConfig, DCA1000Config, RadarDataSerialConfig, RadarSerialConfig
+from .dca1000 import DCA1000Client, DCA1000DataPacket, map_capture_requirements
+from .exceptions import ConfigurationError
 from .live_view import TerminalLiveDashboard
+from .profiles import RadarDeviceProfile
 from .serial_control import RadarSerialController
+from .telemetry_live import TerminalTelemetryDashboard
+from .usb_telemetry import TelemetryStats, TiTelemetryFrame, TiUsbTelemetryStream
 
 
 class PacketConsumer(Protocol):
@@ -138,17 +142,29 @@ class UdpCaptureSink:
 class CaptureOrchestrator:
     """High-level orchestration for configuration and raw capture."""
 
-    def __init__(self, dca_config: DCA1000Config, serial_config: RadarSerialConfig) -> None:
+    def __init__(
+        self,
+        dca_config: DCA1000Config,
+        serial_config: RadarSerialConfig,
+        profile: RadarDeviceProfile,
+        data_serial_config: RadarDataSerialConfig | None = None,
+    ) -> None:
         """Initialize the orchestrator."""
         self._dca_config = dca_config
         self._serial_config = serial_config
+        self._profile = profile
+        self._data_serial_config = data_serial_config
 
     def probe(self, cfg: RadarCliConfig | None = None) -> dict[str, str]:
         """Verify communication with DCA1000 and optionally the radar CLI."""
         results: dict[str, str] = {}
-        with DCA1000Client(self._dca_config) as dca:
-            dca.system_connect()
-            results["dca1000"] = "connected"
+        if self._profile.data_backend == "dca1000-udp":
+            with DCA1000Client(self._dca_config) as dca:
+                dca.system_connect()
+                results["dca1000"] = "connected"
+        elif self._profile.data_backend == "ti-data-uart":
+            with TiUsbTelemetryStream(self._require_data_serial_config()) as telemetry:
+                results["radar_data_uart"] = telemetry.probe()
 
         if cfg is not None:
             with RadarSerialController(self._serial_config) as radar:
@@ -160,7 +176,12 @@ class CaptureOrchestrator:
 
     def capture(self, cfg: RadarCliConfig, capture_config: CaptureConfig) -> CaptureStats:
         """Apply radar config, configure DCA, capture UDP packets, then stop cleanly."""
-        requirements = cfg.validate_for_dca_capture()
+        if not self._profile.supports_raw_capture:
+            raise ConfigurationError(
+                f"Profile '{self._profile.name}' does not support raw capture. Use 'live' with USB telemetry instead."
+            )
+        requirements = cfg.extract_capture_requirements()
+        dca_settings = map_capture_requirements(requirements)
         cfg_commands_before_sensor_start = cfg.command_texts_excluding(("sensorStart",))
         sink = UdpCaptureSink(self._dca_config)
 
@@ -170,8 +191,8 @@ class CaptureOrchestrator:
         ):
             radar.send_cfg_lines(cfg_commands_before_sensor_start)
             dca.configure_for_recording(
-                data_logging_mode=requirements.data_logging_mode,
-                data_format_mode=requirements.data_format_mode,
+                data_logging_mode=dca_settings.data_logging_mode,
+                data_format_mode=dca_settings.data_format_mode,
             )
             dca.start_record()
             radar.sensor_start()
@@ -182,12 +203,18 @@ class CaptureOrchestrator:
                 radar.sensor_stop()
         return stats
 
-    def capture_live(self, cfg: RadarCliConfig, capture_config: CaptureConfig) -> CaptureStats:
-        """Run a live terminal dashboard while optionally saving the raw stream."""
-        requirements = cfg.validate_for_dca_capture()
+    def capture_live(
+        self, cfg: RadarCliConfig, capture_config: CaptureConfig
+    ) -> CaptureStats | TelemetryStats:
+        """Run a live terminal dashboard for the active transport."""
+        if self._profile.data_backend == "ti-data-uart":
+            return self.capture_live_telemetry(cfg=cfg, capture_config=capture_config)
+
+        requirements = cfg.extract_capture_requirements()
+        dca_settings = map_capture_requirements(requirements)
         cfg_commands_before_sensor_start = cfg.command_texts_excluding(("sensorStart",))
         sink = UdpCaptureSink(self._dca_config)
-        dashboard = TerminalLiveDashboard(radar_cfg=cfg)
+        dashboard = TerminalLiveDashboard(radar_cfg=cfg, title=f"{self._profile.display_name} Live")
 
         with (
             DCA1000Client(self._dca_config) as dca,
@@ -195,8 +222,8 @@ class CaptureOrchestrator:
         ):
             radar.send_cfg_lines(cfg_commands_before_sensor_start)
             dca.configure_for_recording(
-                data_logging_mode=requirements.data_logging_mode,
-                data_format_mode=requirements.data_format_mode,
+                data_logging_mode=dca_settings.data_logging_mode,
+                data_format_mode=dca_settings.data_format_mode,
             )
             dashboard.start()
             try:
@@ -217,6 +244,34 @@ class CaptureOrchestrator:
                         dashboard.stop()
         return stats
 
+    def capture_live_telemetry(
+        self, cfg: RadarCliConfig, capture_config: CaptureConfig
+    ) -> TelemetryStats:
+        """Run a live dashboard while reading TI telemetry over the data UART."""
+        cfg_commands_before_sensor_start = cfg.command_texts_excluding(("sensorStart",))
+        dashboard = TerminalTelemetryDashboard(
+            title=f"{self._profile.display_name} Live",
+            radar_cfg=cfg,
+        )
+        telemetry = TiUsbTelemetryStream(self._require_data_serial_config())
+
+        with telemetry, RadarSerialController(self._serial_config) as radar:
+            radar.send_cfg_lines(cfg_commands_before_sensor_start)
+            dashboard.start()
+            try:
+                radar.sensor_start()
+                stats = telemetry.stream(
+                    capture_config,
+                    frame_consumer=self._build_telemetry_live_consumer(dashboard),
+                    stop_condition=lambda: dashboard.stop_requested,
+                )
+            finally:
+                try:
+                    radar.sensor_stop()
+                finally:
+                    dashboard.stop()
+        return stats
+
     @staticmethod
     def _build_live_consumer(dashboard: TerminalLiveDashboard) -> PacketConsumer:
         """Create a packet consumer that refreshes the terminal dashboard."""
@@ -231,3 +286,28 @@ class CaptureOrchestrator:
                 last_render_at = now
 
         return consume
+
+    @staticmethod
+    def _build_telemetry_live_consumer(
+        dashboard: TerminalTelemetryDashboard,
+    ) -> Callable[[TiTelemetryFrame], None]:
+        """Create a frame consumer that refreshes the telemetry dashboard."""
+        last_render_at = time.monotonic()
+
+        def consume(frame: TiTelemetryFrame) -> None:
+            nonlocal last_render_at
+            dashboard.metrics.record_frame(frame)
+            now = time.monotonic()
+            if now - last_render_at >= 0.1:
+                dashboard.update()
+                last_render_at = now
+
+        return consume
+
+    def _require_data_serial_config(self) -> RadarDataSerialConfig:
+        """Return the configured data UART settings for USB telemetry profiles."""
+        if self._data_serial_config is None:
+            raise ConfigurationError(
+                f"Profile '{self._profile.name}' requires --radar-data-port for USB telemetry."
+            )
+        return self._data_serial_config

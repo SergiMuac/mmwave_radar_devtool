@@ -67,6 +67,16 @@ class RadarSerialConfig(BaseModel):
     verbose: bool = False
 
 
+class RadarDataSerialConfig(BaseModel):
+    """Configuration for radar USB/UART telemetry output."""
+
+    data_port: str
+    data_baudrate: PositiveInt = 921600
+    read_timeout_s: float = Field(default=0.1, gt=0.0)
+    poll_interval_s: float = Field(default=0.01, gt=0.0)
+    first_frame_timeout_s: float = Field(default=5.0, gt=0.0)
+
+
 class CaptureConfig(BaseModel):
     """Configuration for a raw UDP capture session."""
 

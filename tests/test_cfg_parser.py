@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from mmwave_radar_devtool.cfg_parser import create_capture_cfg, parse_radar_cfg
-from mmwave_radar_devtool.config import DCA1000DataLoggingMode
 from mmwave_radar_devtool.exceptions import ConfigurationError
 
 
@@ -29,7 +28,7 @@ def test_parse_cfg_rejects_non_ascii_content(tmp_path: Path) -> None:
 
 
 def test_validate_capture_cfg_extracts_adc_and_lvds_requirements(tmp_path: Path) -> None:
-    """The parser should derive DCA1000 capture settings from cfg commands."""
+    """The parser should derive generic capture settings from cfg commands."""
     cfg_path = tmp_path / "capture.cfg"
     cfg_path.write_text(
         "sensorStop\nflushCfg\nadcCfg 2 1\nlvdsStreamCfg -1 0 1 0\nsensorStart\n",
@@ -37,10 +36,11 @@ def test_validate_capture_cfg_extracts_adc_and_lvds_requirements(tmp_path: Path)
     )
 
     cfg = parse_radar_cfg(cfg_path)
-    requirements = cfg.validate_for_dca_capture()
+    requirements = cfg.extract_capture_requirements()
 
-    assert requirements.data_format_mode == 3
-    assert requirements.data_logging_mode is DCA1000DataLoggingMode.RAW
+    assert requirements.adc_cfg.data_format_mode == 3
+    assert requirements.lvds_stream_cfg.enable_header is False
+    assert requirements.lvds_stream_cfg.enable_hw_stream is True
 
 
 def test_validate_capture_cfg_rejects_missing_hw_stream(tmp_path: Path) -> None:
@@ -54,7 +54,7 @@ def test_validate_capture_cfg_rejects_missing_hw_stream(tmp_path: Path) -> None:
     cfg = parse_radar_cfg(cfg_path)
 
     with pytest.raises(ConfigurationError):
-        cfg.validate_for_dca_capture()
+        cfg.extract_capture_requirements()
 
 
 def test_create_capture_cfg_rewrites_lvds_stream_cfg(tmp_path: Path) -> None:

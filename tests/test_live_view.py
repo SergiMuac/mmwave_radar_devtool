@@ -49,3 +49,9 @@ def test_dashboard_can_switch_modes_with_cfg_context() -> None:
     dashboard.metrics.current_mode = SignalViewMode.RANGE
     plot_series = dashboard._build_plot_series()
     assert plot_series.title.startswith("Approximate range profile")
+
+
+def test_dashboard_uses_generic_default_title() -> None:
+    """The dashboard title should not be tied to one board."""
+    dashboard = TerminalLiveDashboard()
+    assert dashboard._title == "TI mmWave + DCA1000 Live"
