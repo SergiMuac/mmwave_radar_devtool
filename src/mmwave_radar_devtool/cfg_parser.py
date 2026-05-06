@@ -66,6 +66,36 @@ class ProfileCfg:
 
 
 @dataclass(slots=True, frozen=True)
+class AdcBufCfg:
+    """Decoded adcbufCfg fields relevant for IQ sample ordering."""
+
+    subframe_idx: int
+    adc_output_format: int
+    sample_swap: int
+    channel_interleave: int
+    chirp_threshold: int
+
+    @property
+    def q_first(self) -> bool:
+        """Return whether the stream orders Q samples before I samples."""
+        return self.sample_swap == 1
+
+
+@dataclass(slots=True, frozen=True)
+class ChannelCfg:
+    """Decoded channelCfg fields used for channel count metadata."""
+
+    rx_channel_enable_mask: int
+    tx_channel_enable_mask: int
+    cascading: int
+
+    @property
+    def num_enabled_rx(self) -> int:
+        """Return how many RX channels are enabled by the mask."""
+        return int(bin(self.rx_channel_enable_mask & 0xF).count("1"))
+
+
+@dataclass(slots=True, frozen=True)
 class RadarCaptureRequirements:
     """Capture settings derived from the radar cfg."""
 
@@ -170,6 +200,58 @@ class RadarCliConfig:
                 f"Malformed profileCfg numeric fields at line {line.line_number}: {line.text}"
             ) from exc
 
+    def parse_adcbuf_cfg(self) -> AdcBufCfg:
+        """Parse adcbufCfg for sample ordering metadata."""
+        line = self.find_first("adcbufCfg")
+        if line is None:
+            raise ConfigurationError("Configuration file does not contain adcbufCfg.")
+
+        parts = line.text.split()
+        if len(parts) != 6:
+            raise ConfigurationError(
+                f"Malformed adcbufCfg command at line {line.line_number}: {line.text}"
+            )
+
+        try:
+            return AdcBufCfg(
+                subframe_idx=int(parts[1]),
+                adc_output_format=int(parts[2]),
+                sample_swap=int(parts[3]),
+                channel_interleave=int(parts[4]),
+                chirp_threshold=int(parts[5]),
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"Malformed adcbufCfg numeric fields at line {line.line_number}: {line.text}"
+            ) from exc
+
+    def parse_channel_cfg(self) -> ChannelCfg:
+        """Parse channelCfg for enabled RX/TX masks."""
+        line = self.find_first("channelCfg")
+        if line is None:
+            raise ConfigurationError("Configuration file does not contain channelCfg.")
+
+        parts = line.text.split()
+        if len(parts) != 4:
+            raise ConfigurationError(
+                f"Malformed channelCfg command at line {line.line_number}: {line.text}"
+            )
+
+        try:
+            rx_channel_enable_mask = int(parts[1])
+            tx_channel_enable_mask = int(parts[2])
+            cascading = int(parts[3])
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"Malformed channelCfg numeric fields at line {line.line_number}: {line.text}"
+            ) from exc
+
+        return ChannelCfg(
+            rx_channel_enable_mask=rx_channel_enable_mask,
+            tx_channel_enable_mask=tx_channel_enable_mask,
+            cascading=cascading,
+        )
+
     def parse_lvds_stream_cfg(self) -> LvdsStreamCfg:
         """Parse the lvdsStreamCfg command."""
         line = self.find_first("lvdsStreamCfg")
@@ -243,10 +325,11 @@ def parse_radar_cfg(path: str | Path) -> RadarCliConfig:
         raise ConfigurationError(f"Configuration file does not exist: {cfg_path}")
 
     try:
-        raw_lines = cfg_path.read_text(encoding="ascii", errors="strict").splitlines()
+        # Decode as UTF-8 so non-ASCII comment text is accepted.
+        raw_lines = cfg_path.read_text(encoding="utf-8", errors="strict").splitlines()
     except UnicodeDecodeError as exc:
         raise ConfigurationError(
-            f"Configuration file must be plain ASCII text: {cfg_path}"
+            f"Configuration file must be valid UTF-8 text: {cfg_path}"
         ) from exc
 
     commands: list[RadarCliLine] = []

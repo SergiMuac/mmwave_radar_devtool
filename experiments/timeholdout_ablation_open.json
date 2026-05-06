@@ -1,0 +1,32 @@
+{
+  "experiments": {
+    "dataset_dir": "dataset_open_train",
+    "cfg": "config/xwr18xx_profile_raw_capture.cfg",
+    "out_dir": "outputs/ml/grid_timeholdout_open",
+
+    "feature_mode": ["zero_doppler_db", "complex_coherent"],
+    "target_range_m": [0.4],
+    "range_gate_bins": [2, 4],
+    "background_subtraction": ["none", "complex_range"],
+    "background_capture": "dataset/baselines/baseline_open.bin",
+
+    "normalization_mode": ["trainset_standardize", "per_recording_standardize"],
+    "sample_mode": "frames",
+    "seeds": [0, 1],
+
+    "epochs": 60,
+    "min_epochs": 8,
+    "early_stop_patience": 10,
+    "batch_size": 64,
+    "hidden_dims": "256,128",
+    "dropout": 0.3,
+    "lr": 0.0007,
+    "weight_decay": 0.001,
+
+    "range_side": "positive",
+    "window_kind": "hann",
+    "eps": 1e-9,
+    "save_best_val": true,
+    "device": "auto"
+  }
+}

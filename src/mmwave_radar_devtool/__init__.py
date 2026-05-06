@@ -6,6 +6,8 @@ __all__ = [
     "config",
     "dca1000",
     "exceptions",
+    "ml",
+    "range_profile_dataset",
     "parser",
     "serial_control",
     "visualize",

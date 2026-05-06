@@ -11,7 +11,8 @@ from typing import Callable, Protocol
 from .cfg_parser import RadarCliConfig
 from .config import CaptureConfig, DCA1000Config, RadarSerialConfig
 from .dca1000 import DCA1000Client, DCA1000DataPacket
-from .live_view import TerminalLiveDashboard
+from .exceptions import DCA1000ResponseError
+from .live_view import LiveSignalProcessingConfig, TerminalLiveDashboard
 from .serial_control import RadarSerialController
 
 
@@ -20,6 +21,13 @@ class PacketConsumer(Protocol):
 
     def __call__(self, packet: DCA1000DataPacket) -> None:
         """Handle one decoded UDP packet."""
+
+
+class MalformedDatagramConsumer(Protocol):
+    """Callback protocol for malformed UDP datagrams."""
+
+    def __call__(self, datagram_size: int) -> None:
+        """Handle one malformed datagram size."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,6 +41,7 @@ class CaptureStats:
     first_sequence_number: int | None
     last_sequence_number: int | None
     sequence_gaps_detected: int
+    malformed_datagrams_detected: int
 
 
 class UdpCaptureSink:
@@ -47,6 +56,7 @@ class UdpCaptureSink:
         capture_config: CaptureConfig,
         *,
         packet_consumer: PacketConsumer | None = None,
+        malformed_datagram_consumer: MalformedDatagramConsumer | None = None,
         stop_condition: Callable[[], bool] | None = None,
     ) -> CaptureStats:
         """Capture UDP payloads for a bounded or continuous session and optionally save them."""
@@ -70,6 +80,7 @@ class UdpCaptureSink:
         first_sequence_number: int | None = None
         last_sequence_number: int | None = None
         sequence_gaps_detected = 0
+        malformed_datagrams_detected = 0
         file_handle = output_path.open("wb") if output_path is not None else None
 
         try:
@@ -90,7 +101,13 @@ class UdpCaptureSink:
 
                 packets_received += 1
                 bytes_received += len(datagram)
-                data_packet = DCA1000DataPacket.from_udp_datagram(datagram)
+                try:
+                    data_packet = DCA1000DataPacket.from_udp_datagram(datagram)
+                except DCA1000ResponseError:
+                    malformed_datagrams_detected += 1
+                    if malformed_datagram_consumer is not None:
+                        malformed_datagram_consumer(len(datagram))
+                    continue
 
                 if first_sequence_number is None:
                     first_sequence_number = data_packet.sequence_number
@@ -128,6 +145,7 @@ class UdpCaptureSink:
             first_sequence_number=first_sequence_number,
             last_sequence_number=last_sequence_number,
             sequence_gaps_detected=sequence_gaps_detected,
+            malformed_datagrams_detected=malformed_datagrams_detected,
         )
 
     def capture_to_file(self, capture_config: CaptureConfig) -> CaptureStats:
@@ -182,12 +200,21 @@ class CaptureOrchestrator:
                 radar.sensor_stop()
         return stats
 
-    def capture_live(self, cfg: RadarCliConfig, capture_config: CaptureConfig) -> CaptureStats:
+    def capture_live(
+        self,
+        cfg: RadarCliConfig,
+        capture_config: CaptureConfig,
+        *,
+        live_processing_config: LiveSignalProcessingConfig | None = None,
+    ) -> CaptureStats:
         """Run a live terminal dashboard while optionally saving the raw stream."""
         requirements = cfg.validate_for_dca_capture()
         cfg_commands_before_sensor_start = cfg.command_texts_excluding(("sensorStart",))
         sink = UdpCaptureSink(self._dca_config)
-        dashboard = TerminalLiveDashboard(radar_cfg=cfg)
+        dashboard = TerminalLiveDashboard(
+            radar_cfg=cfg,
+            processing_config=live_processing_config,
+        )
 
         with (
             DCA1000Client(self._dca_config) as dca,
@@ -205,6 +232,7 @@ class CaptureOrchestrator:
                 stats = sink.capture_stream(
                     capture_config,
                     packet_consumer=self._build_live_consumer(dashboard),
+                    malformed_datagram_consumer=dashboard.metrics.record_malformed_datagram,
                     stop_condition=lambda: dashboard.stop_requested,
                 )
             finally:
@@ -217,8 +245,7 @@ class CaptureOrchestrator:
                         dashboard.stop()
         return stats
 
-    @staticmethod
-    def _build_live_consumer(dashboard: TerminalLiveDashboard) -> PacketConsumer:
+    def _build_live_consumer(self, dashboard: TerminalLiveDashboard) -> PacketConsumer:
         """Create a packet consumer that refreshes the terminal dashboard."""
         last_render_at = time.monotonic()
 

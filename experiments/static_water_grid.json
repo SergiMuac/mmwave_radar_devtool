@@ -1,0 +1,28 @@
+{
+  "experiments": {
+    "dataset_dir": "dataset_open",
+    "cfg": "config/xwr18xx_profile_raw_capture.cfg",
+    "background_capture": "dataset/baselines/baseline_open.bin",
+    "target_range_m": [0.4],
+    "range_gate_bins": [2, 4, 6],
+    "feature_mode": ["zero_doppler_db", "complex_coherent"],
+    "background_subtraction": ["none", "complex_range"],
+    "normalization_mode": ["trainset_standardize", "none"],
+    "seeds": [0, 1],
+    "out_dir": "outputs/ml/grid_static_water",
+    "epochs": 40,
+    "min_epochs": 8,
+    "early_stop_patience": 10,
+    "batch_size": 128,
+    "hidden_dims": "512,256",
+    "dropout": 0.2,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "sample_mode": "frames",
+    "range_side": "positive",
+    "window_kind": "hann",
+    "eps": 1e-9,
+    "save_best_val": true,
+    "device": "auto"
+  }
+}

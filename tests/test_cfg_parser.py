@@ -28,6 +28,16 @@ def test_parse_cfg_rejects_non_ascii_content(tmp_path: Path) -> None:
         parse_radar_cfg(cfg_path)
 
 
+def test_parse_cfg_allows_non_ascii_comments(tmp_path: Path) -> None:
+    """The parser should allow UTF-8 comments while keeping CLI lines ASCII."""
+    cfg_path = tmp_path / "comments.cfg"
+    cfg_path.write_text("% Range resolution ≈ 4.36 cm\nsensorStop\n", encoding="utf-8")
+
+    cfg = parse_radar_cfg(cfg_path)
+
+    assert cfg.texts() == ["sensorStop"]
+
+
 def test_validate_capture_cfg_extracts_adc_and_lvds_requirements(tmp_path: Path) -> None:
     """The parser should derive DCA1000 capture settings from cfg commands."""
     cfg_path = tmp_path / "capture.cfg"
@@ -41,6 +51,22 @@ def test_validate_capture_cfg_extracts_adc_and_lvds_requirements(tmp_path: Path)
 
     assert requirements.data_format_mode == 3
     assert requirements.data_logging_mode is DCA1000DataLoggingMode.RAW
+
+
+def test_parse_channel_and_adcbuf_metadata(tmp_path: Path) -> None:
+    """Channel and adcbuf metadata should be parsed for live decoding context."""
+    cfg_path = tmp_path / "meta.cfg"
+    cfg_path.write_text(
+        "channelCfg 15 1 0\nadcbufCfg -1 0 1 1 1\nadcCfg 2 1\nlvdsStreamCfg -1 0 1 0\n",
+        encoding="ascii",
+    )
+    cfg = parse_radar_cfg(cfg_path)
+
+    channel = cfg.parse_channel_cfg()
+    adcbuf = cfg.parse_adcbuf_cfg()
+
+    assert channel.num_enabled_rx == 4
+    assert adcbuf.q_first is True
 
 
 def test_validate_capture_cfg_rejects_missing_hw_stream(tmp_path: Path) -> None:

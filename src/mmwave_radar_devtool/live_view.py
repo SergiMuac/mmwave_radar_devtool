@@ -1,8 +1,7 @@
-"""Rich live dashboard for radar capture telemetry and simple signal views."""
+"""Rich live dashboard for radar capture telemetry and range-profile views."""
 
 from __future__ import annotations
 
-import math
 import shutil
 import sys
 import termios
@@ -10,9 +9,11 @@ import threading
 import time
 import tty
 from collections import deque
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Callable
+from enum import StrEnum
+from itertools import pairwise
 
 import numpy as np
 from rich.console import Console, Group, RenderableType
@@ -21,13 +22,14 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .cfg_parser import ProfileCfg, RadarCliConfig
+from .cfg_parser import RadarCliConfig
 from .dca1000 import DCA1000DataPacket
+from .exceptions import ConfigurationError
 
 C_M_PER_S = 299_792_458.0
 
 
-class SignalViewMode(str, Enum):
+class SignalViewMode(StrEnum):
     """Selectable signal processing modes for the live plot."""
 
     RAW = "raw"
@@ -46,6 +48,37 @@ class PlotSeries:
     right_label: str
     unit: str
     accent: str
+    y_min: float | None = None
+    y_max: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class LivePredictionResult:
+    """Small prediction payload rendered by the live dashboard."""
+
+    task: str
+    primary: str
+    confidence: float | None = None
+    detail: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class LiveSignalProcessingConfig:
+    """User-tunable processing options for live spectrum/range views."""
+
+    decode_order: str = "iiqq"
+    range_window_kind: str = "hann"
+    range_side: str = "positive"
+    normalize_spectrum_to_peak: bool = False
+    normalize_range_to_peak: bool = False
+    spectrum_db_min: float | None = 0.0
+    spectrum_db_max: float | None = None
+    range_db_min: float | None = None
+    range_db_max: float | None = None
+    chirp_alignment_offset: int = -1
+    baseline_range_db: np.ndarray | None = None
+    prediction_callback: Callable[[np.ndarray], LivePredictionResult | None] | None = None
+    prediction_interval_s: float = 0.5
 
 
 @dataclass(slots=True)
@@ -59,6 +92,7 @@ class LiveMetrics:
     first_sequence_number: int | None = None
     last_sequence_number: int | None = None
     sequence_gaps_detected: int = 0
+    malformed_datagrams_detected: int = 0
     recent_packet_rates: deque[float] = field(default_factory=lambda: deque(maxlen=180))
     recent_throughput_rates: deque[float] = field(default_factory=lambda: deque(maxlen=180))
     packets_since_last_rate: int = 0
@@ -67,6 +101,11 @@ class LiveMetrics:
     current_mode: SignalViewMode = SignalViewMode.RAW
     latest_raw: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     latest_complex: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.complex64))
+    complex_history: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.complex64))
+    max_complex_history: int = 524_288
+    complex_history_start_index: int = 0
+    decode_order: str = "iiqq"
+    q_first: bool = False
 
     def record_packet(self, packet: DCA1000DataPacket) -> None:
         """Update live metrics from a packet."""
@@ -102,6 +141,10 @@ class LiveMetrics:
         self.bytes_since_last_rate = 0
         self.last_rate_timestamp = now
 
+    def record_malformed_datagram(self, _: int) -> None:
+        """Record a malformed datagram that could not be parsed."""
+        self.malformed_datagrams_detected += 1
+
     def _update_signal_buffers(self, payload: bytes) -> None:
         """Decode raw payload bytes into real and complex sample views."""
         if not payload:
@@ -113,9 +156,23 @@ class LiveMetrics:
         if samples.size < 4:
             return
         self.latest_raw = samples[-2048:]
-        even_count = (samples.size // 2) * 2
-        iq = samples[:even_count].reshape(-1, 2)
-        self.latest_complex = (iq[:, 0] + 1j * iq[:, 1]).astype(np.complex64)[-1024:]
+        complex_samples = _decode_dca_complex_words(
+            samples,
+            decode_order=self.decode_order,
+            q_first=self.q_first,
+        )
+        if complex_samples.size == 0:
+            return
+        if self.complex_history.size == 0:
+            updated = complex_samples
+        else:
+            updated = np.concatenate((self.complex_history, complex_samples))
+        if updated.size > self.max_complex_history:
+            removed = updated.size - self.max_complex_history
+            updated = updated[removed:]
+            self.complex_history_start_index += removed
+        self.complex_history = updated.astype(np.complex64)
+        self.latest_complex = self.complex_history[-4096:]
 
 
 @dataclass(slots=True)
@@ -147,10 +204,8 @@ class InputController:
         if self._thread is not None:
             self._thread.join(timeout=0.2)
         if self._original_termios is not None and sys.stdin.isatty():
-            try:
+            with suppress(termios.error):
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._original_termios)
-            except termios.error:
-                pass
             self._original_termios = None
 
     def _run(self) -> None:
@@ -170,9 +225,7 @@ class InputController:
                 self.mode_callback(SignalViewMode.SPECTRUM)
             elif key == "4":
                 self.mode_callback(SignalViewMode.RANGE)
-            elif key in {"q", "Q"}:
-                self.stop_callback()
-            elif key == "\x03":
+            elif key in {"q", "Q", "\x03"}:
                 self.stop_callback()
 
 
@@ -180,7 +233,10 @@ class TerminalLiveDashboard:
     """Rich terminal dashboard for live radar telemetry and simple plots."""
 
     def __init__(
-        self, radar_cfg: RadarCliConfig | None = None, title: str = "IWR1843 • DCA1000 Live"
+        self,
+        radar_cfg: RadarCliConfig | None = None,
+        title: str = "IWR1843 • DCA1000 Live",
+        processing_config: LiveSignalProcessingConfig | None = None,
     ) -> None:
         """Initialize the dashboard."""
         self._title = title
@@ -190,6 +246,27 @@ class TerminalLiveDashboard:
         self._active = False
         self._stop_requested = False
         self._profile_cfg = radar_cfg.parse_profile_cfg() if radar_cfg is not None else None
+        self._processing = processing_config or LiveSignalProcessingConfig()
+        self._rx_count = 1
+        self._chirps_per_frame = 16
+        self._auto_alignment_enabled = self._processing.chirp_alignment_offset < 0
+        self._resolved_chirp_alignment_offset: int | None = None
+        if radar_cfg is not None:
+            try:
+                self._rx_count = max(1, radar_cfg.parse_channel_cfg().num_enabled_rx)
+            except ConfigurationError:
+                self._rx_count = 1
+            self._chirps_per_frame = _parse_chirps_per_frame(radar_cfg) or 16
+            try:
+                self._metrics.q_first = radar_cfg.parse_adcbuf_cfg().q_first
+            except ConfigurationError:
+                self._metrics.q_first = False
+        self._metrics.decode_order = self._processing.decode_order
+        self._y_limits_by_mode: dict[SignalViewMode, tuple[float, float]] = {}
+        self._display_limits_by_mode: dict[SignalViewMode, tuple[float, float]] = {}
+        self._latest_prediction: LivePredictionResult | None = None
+        self._last_prediction_at = 0.0
+        self._prediction_error: str | None = None
         self._input = InputController(
             mode_callback=self._set_mode,
             stop_callback=self.request_stop,
@@ -256,6 +333,7 @@ class TerminalLiveDashboard:
             if self._metrics.recent_throughput_rates
             else 0.0
         )
+        prediction = self._update_prediction()
         main_plot = _render_line_plot(
             self._build_plot_series(),
             width=max(40, width - 10),
@@ -277,11 +355,27 @@ class TerminalLiveDashboard:
             _metric_tile("Last seq", str(self._metrics.last_sequence_number), "#a855f7"),
             _metric_tile("Gaps", f"{self._metrics.sequence_gaps_detected:,}", "#ef4444"),
         )
+        summary.add_row(
+            _metric_tile("Malformed", f"{self._metrics.malformed_datagrams_detected:,}", "#f97316"),
+            _metric_tile("Mode", self._metrics.current_mode.value.upper(), "#f43f5e"),
+            _metric_tile("RX", str(self._rx_count), "#a78bfa"),
+            _metric_tile("Chirps/frame", str(self._chirps_per_frame), "#eab308"),
+        )
+        if self._processing.prediction_callback is not None:
+            summary.add_row(
+                _metric_tile("NN", self._prediction_primary(prediction), "#22c55e"),
+                _metric_tile("NN task", self._prediction_task(prediction), "#38bdf8"),
+                _metric_tile("Confidence", self._prediction_confidence(prediction), "#f59e0b"),
+                _metric_tile("NN detail", self._prediction_detail(prediction), "#c084fc"),
+            )
 
         controls = Panel(
             _render_mode_tabs(self._metrics.current_mode),
             title="Views",
-            subtitle="Keys: 1 Raw   2 Intensity   3 Spectrum   4 Range FFT   q Quit",
+            subtitle=(
+                "Keys: 1 Raw   2 Intensity   3 Spectrum   4 Range FFT   q Quit"
+                f"   |   Align: {self._alignment_status_label()}"
+            ),
             border_style="#334155",
             padding=(0, 1),
         )
@@ -303,11 +397,41 @@ class TerminalLiveDashboard:
             return self._build_spectrum_series()
         return self._build_range_series()
 
+    def _update_prediction(self) -> LivePredictionResult | None:
+        """Run throttled live ML prediction on the latest complete frame."""
+        callback = self._processing.prediction_callback
+        if callback is None:
+            return None
+
+        now = time.monotonic()
+        interval = max(0.05, float(self._processing.prediction_interval_s))
+        if self._latest_prediction is not None and now - self._last_prediction_at < interval:
+            return self._latest_prediction
+
+        frame_db = self._compute_zero_doppler_frame_by_rx_db()
+        if frame_db is None:
+            return self._latest_prediction
+
+        try:
+            prediction = callback(frame_db)
+        except Exception as exc:  # pragma: no cover - visible in live UI.
+            self._prediction_error = type(exc).__name__
+            return self._latest_prediction
+
+        if prediction is not None:
+            self._latest_prediction = prediction
+            self._last_prediction_at = now
+            self._prediction_error = None
+        return self._latest_prediction
+
     def _build_raw_series(self) -> PlotSeries:
         """Build a raw sample waveform plot."""
         values = self._metrics.latest_raw
         if values.size == 0:
             values = np.zeros(128, dtype=np.float32)
+            y_min, y_max = -1.0, 1.0
+        else:
+            y_min, y_max = self._stabilized_limits(SignalViewMode.RAW, values)
         return PlotSeries(
             values=values.astype(np.float32),
             title="Raw ADC waveform",
@@ -315,71 +439,386 @@ class TerminalLiveDashboard:
             right_label=f"{values.size} samples",
             unit="adc",
             accent="#22d3ee",
+            y_min=y_min,
+            y_max=y_max,
         )
 
     def _build_intensity_series(self) -> PlotSeries:
         """Build a short-window intensity envelope plot."""
-        values = np.abs(self._metrics.latest_complex)
-        if values.size == 0:
+        chirp_cube = self._compute_chirp_time_cube()
+        if chirp_cube.size == 0:
             values = np.zeros(128, dtype=np.float32)
-        if values.size >= 8:
-            kernel = np.ones(8, dtype=np.float32) / 8.0
-            values = np.convolve(values.astype(np.float32), kernel, mode="same")
+        else:
+            # Show one RX waveform per chirp instead of concatenated RX streams.
+            values = np.abs(chirp_cube[-1, 0, :]).astype(np.float32)
+            if values.size >= 8:
+                kernel = np.ones(8, dtype=np.float32) / 8.0
+                values = np.convolve(values.astype(np.float32), kernel, mode="same")
+        y_min, y_max = self._stabilized_limits(SignalViewMode.INTENSITY, values)
         return PlotSeries(
             values=values.astype(np.float32),
-            title="Instantaneous intensity envelope",
+            title="Intensity envelope (last chirp, RX0)",
             left_label="near",
             right_label="farther samples",
             unit="|IQ|",
             accent="#34d399",
+            y_min=y_min,
+            y_max=y_max,
         )
 
     def _build_spectrum_series(self) -> PlotSeries:
-        """Build a frequency-domain magnitude spectrum."""
-        values = self._metrics.latest_complex
-        if values.size == 0:
-            spectrum = np.zeros(128, dtype=np.float32)
-        else:
-            windowed = values * np.hanning(values.size)
-            spectrum = np.abs(np.fft.fft(windowed))[: max(8, values.size // 2)]
+        """Build FFT magnitude of the real-valued chirp response, averaged over chirps/RX."""
+        spectrum = self._compute_chirp_aligned_spectrum()
+        spectrum_db = _magnitude_to_db(
+            spectrum,
+            normalize_to_peak=self._processing.normalize_spectrum_to_peak,
+            floor_db=-120.0,
+        )
+        y_min, y_max = self._resolve_db_limits(
+            SignalViewMode.SPECTRUM,
+            spectrum_db,
+            configured_min=self._processing.spectrum_db_min,
+            configured_max=self._processing.spectrum_db_max,
+        )
         return PlotSeries(
-            values=spectrum.astype(np.float32),
-            title="Beat-frequency magnitude spectrum",
-            left_label="0 Hz",
-            right_label=self._format_max_frequency(len(spectrum)),
-            unit="mag",
+            values=spectrum_db.astype(np.float32),
+            title="FFT(real response) magnitude (avg chirps/RX)",
+            left_label="0 m",
+            right_label=self._format_max_frequency_or_range(len(spectrum)),
+            unit="dB",
             accent="#c084fc",
+            y_min=y_min,
+            y_max=y_max,
         )
 
     def _build_range_series(self) -> PlotSeries:
-        """Build a simple range FFT magnitude plot."""
-        values = self._metrics.latest_complex
-        if values.size == 0:
-            spectrum = np.zeros(128, dtype=np.float32)
+        """Build a zero-Doppler TI-demo-like range profile."""
+        profile = self._compute_zero_doppler_profile()
+        baseline = self._processing.baseline_range_db
+        if baseline is None:
+            spectrum_db = _power_to_db(
+                profile,
+                normalize_to_peak=self._processing.normalize_range_to_peak,
+                floor_db=-120.0,
+            )
+            title = "Zero-Doppler range profile (RX-mean power)"
         else:
-            windowed = values * np.hanning(values.size)
-            spectrum = np.abs(np.fft.fft(windowed))[: max(8, values.size // 2)]
+            current_db = _power_to_db(
+                profile,
+                normalize_to_peak=False,
+                floor_db=-120.0,
+            )
+            baseline_db = np.asarray(baseline, dtype=np.float32)
+            use_bins = min(current_db.size, baseline_db.size)
+            if use_bins <= 0:
+                spectrum_db = np.zeros(128, dtype=np.float32)
+            else:
+                spectrum_db = np.abs(current_db[:use_bins] - baseline_db[:use_bins]).astype(
+                    np.float32
+                )
+            if self._processing.normalize_range_to_peak and spectrum_db.size > 0:
+                spectrum_db = spectrum_db - float(np.max(spectrum_db))
+            title = "Zero-Doppler absolute range delta vs baseline (RX-mean power)"
+        configured_min = self._processing.range_db_min
+        if baseline is not None and configured_min is None:
+            configured_min = 0.0
+        y_min, y_max = self._resolve_db_limits(
+            SignalViewMode.RANGE,
+            spectrum_db,
+            configured_min=configured_min,
+            configured_max=self._processing.range_db_max,
+        )
         return PlotSeries(
-            values=spectrum.astype(np.float32),
-            title="Approximate range profile (FFT)",
+            values=spectrum_db.astype(np.float32),
+            title=title,
             left_label="0 m",
-            right_label=self._format_max_range(len(spectrum)),
-            unit="mag",
+            right_label=self._format_max_range(len(spectrum_db)),
+            unit="dB",
             accent="#f59e0b",
+            y_min=y_min,
+            y_max=y_max,
         )
 
-    def _format_max_frequency(self, bin_count: int) -> str:
-        """Format the right-edge frequency axis label."""
+    def _compute_chirp_aligned_spectrum(self) -> np.ndarray:
+        """Compute averaged FFT magnitude using only the real component of chirp signals."""
+        chirp_cube = self._compute_chirp_time_cube()
+        if chirp_cube.size == 0:
+            return np.zeros(128, dtype=np.float32)
+
+        samples_per_chirp = chirp_cube.shape[-1]
+        if self._processing.range_window_kind == "rect":
+            window = np.ones(samples_per_chirp, dtype=np.float32)
+        else:
+            window = np.hanning(samples_per_chirp).astype(np.float32)
+
+        real_response = np.real(chirp_cube).astype(np.float32)
+        fft_values = np.fft.fft(real_response * window[None, None, :], axis=-1)
+        if self._processing.range_side != "full":
+            fft_values = _select_range_side(fft_values, side=self._processing.range_side)
+        magnitude = np.abs(fft_values)
+        spectrum = magnitude.mean(axis=(0, 1))
+        return spectrum.astype(np.float32)
+
+    def _compute_zero_doppler_profile(self) -> np.ndarray:
+        """Compute TI-demo-like zero-Doppler power profile over range bins."""
+        range_cube = self._compute_range_cube()
+        if range_cube.size == 0:
+            return np.zeros(128, dtype=np.float32)
+        if range_cube.shape[0] >= 2:
+            doppler_cube = np.fft.fft(range_cube, axis=0)
+            zero_doppler_power = np.mean(np.abs(doppler_cube[0, :, :]) ** 2, axis=0)
+        else:
+            zero_doppler_power = np.mean(np.abs(range_cube[0, :, :]) ** 2, axis=0)
+        side = self._processing.range_side
+        if side != "full":
+            zero_doppler_power = _select_range_side(zero_doppler_power, side=side)
+        return zero_doppler_power.astype(np.float32)
+
+    def _compute_zero_doppler_frame_by_rx_db(self) -> np.ndarray | None:
+        """Compute latest ML frame as raw zero-Doppler dB with shape `[RX, B]`."""
+        range_cube = self._compute_range_cube()
+        if range_cube.size == 0 or range_cube.shape[0] < self._chirps_per_frame:
+            return None
+        doppler_cube = np.fft.fft(range_cube, axis=0)
+        power_by_rx = (np.abs(doppler_cube[0, :, :]) ** 2).astype(np.float32)
+        return (10.0 * np.log10(power_by_rx + 1e-9)).astype(np.float32)
+
+    def _compute_range_cube(self) -> np.ndarray:
+        """Build [chirp, rx, range_bin] complex range cube from latest history."""
+        chirp_cube = self._compute_chirp_time_cube()
+        if chirp_cube.size == 0:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+        samples_per_chirp = chirp_cube.shape[-1]
+
+        if self._processing.range_window_kind == "rect":
+            window = np.ones(samples_per_chirp, dtype=np.float32)
+        else:
+            window = np.hanning(samples_per_chirp).astype(np.float32)
+
+        range_cube = np.fft.fft(chirp_cube * window[None, None, :], axis=-1)
+        side = self._processing.range_side
+        if side != "full":
+            range_cube = _select_range_side(range_cube, side=side)
+        return range_cube.astype(np.complex64)
+
+    def _compute_chirp_time_cube(self) -> np.ndarray:
+        """Build [chirp, rx, adc_sample] complex time cube with stable chirp alignment."""
+        values = self._metrics.complex_history
+        profile = self._profile_cfg
+        if values.size == 0:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+        if profile is None:
+            return values.reshape(1, 1, -1).astype(np.complex64)
+
+        samples_per_chirp = int(profile.num_adc_samples)
+        if samples_per_chirp <= 0:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+        samples_per_chirp_all_rx = samples_per_chirp * self._rx_count
+        if samples_per_chirp_all_rx <= 0:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+
+        history_start = self._metrics.complex_history_start_index
+        alignment = self._resolve_chirp_alignment_offset(
+            values=values,
+            history_start=history_start,
+            samples_per_chirp_all_rx=samples_per_chirp_all_rx,
+            samples_per_chirp=samples_per_chirp,
+        )
+        first_local = (
+            alignment - (history_start % samples_per_chirp_all_rx)
+        ) % samples_per_chirp_all_rx
+        if first_local >= values.size:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+
+        aligned = values[first_local:]
+        available_chirps = aligned.size // samples_per_chirp_all_rx
+        if available_chirps <= 0:
+            return np.zeros((0, self._rx_count, 0), dtype=np.complex64)
+
+        chirps_to_use = min(max(self._chirps_per_frame, 1), available_chirps)
+        usable = chirps_to_use * samples_per_chirp_all_rx
+        return aligned[-usable:].reshape(chirps_to_use, self._rx_count, samples_per_chirp).astype(
+            np.complex64
+        )
+
+    def _resolve_chirp_alignment_offset(
+        self,
+        *,
+        values: np.ndarray,
+        history_start: int,
+        samples_per_chirp_all_rx: int,
+        samples_per_chirp: int,
+    ) -> int:
+        """Resolve chirp alignment offset, auto-estimating when configured."""
+        if not self._auto_alignment_enabled:
+            return int(self._processing.chirp_alignment_offset) % samples_per_chirp_all_rx
+
+        if self._resolved_chirp_alignment_offset is not None:
+            return self._resolved_chirp_alignment_offset
+
+        minimum_chirps_for_estimate = max(self._chirps_per_frame * 8, 128)
+        if values.size < minimum_chirps_for_estimate * samples_per_chirp_all_rx:
+            return 0
+
+        estimate = self._estimate_chirp_alignment_offset(
+            values=values,
+            history_start=history_start,
+            samples_per_chirp_all_rx=samples_per_chirp_all_rx,
+            samples_per_chirp=samples_per_chirp,
+        )
+        self._resolved_chirp_alignment_offset = estimate
+        return estimate
+
+    def _estimate_chirp_alignment_offset(
+        self,
+        *,
+        values: np.ndarray,
+        history_start: int,
+        samples_per_chirp_all_rx: int,
+        samples_per_chirp: int,
+    ) -> int:
+        """Estimate chirp alignment by minimizing mode-3/4 frame-to-frame instability."""
+        step = 16
+        window = np.hanning(samples_per_chirp).astype(np.float32)
+        eps = 1e-9
+        best_score: float | None = None
+        best_offset = 0
+
+        for offset in range(0, samples_per_chirp_all_rx, step):
+            first_local = (
+                offset - (history_start % samples_per_chirp_all_rx)
+            ) % samples_per_chirp_all_rx
+            if first_local >= values.size:
+                continue
+            aligned = values[first_local:]
+            available_chirps = aligned.size // samples_per_chirp_all_rx
+            if available_chirps < self._chirps_per_frame * 2:
+                continue
+            use_chirps = min(available_chirps, self._chirps_per_frame * 32)
+            frame_count = use_chirps // self._chirps_per_frame
+            if frame_count < 2:
+                continue
+            use_chirps = frame_count * self._chirps_per_frame
+            tail = aligned[-use_chirps * samples_per_chirp_all_rx :]
+            frame_cube = tail.reshape(
+                frame_count,
+                self._chirps_per_frame,
+                self._rx_count,
+                samples_per_chirp,
+            )
+            range_cube = np.fft.fft(frame_cube * window[None, None, None, :], axis=-1)
+            if self._processing.range_side != "full":
+                range_cube = _select_range_side(range_cube, side=self._processing.range_side)
+
+            # Mode 3 proxy: frame-wise average range FFT magnitude.
+            mode3_db = 20.0 * np.log10(np.abs(range_cube).mean(axis=(1, 2)) + eps)
+
+            # Mode 4 proxy: frame-wise zero-Doppler RX-mean power profile.
+            doppler_cube = np.fft.fft(range_cube, axis=1)
+            zero_doppler_power = np.mean(np.abs(doppler_cube[:, 0, :, :]) ** 2, axis=1)
+            mode4_db = 10.0 * np.log10(zero_doppler_power + eps)
+
+            if mode3_db.shape[1] < 8 or mode4_db.shape[1] < 8:
+                continue
+
+            flicker3 = float(np.mean(np.abs(np.diff(mode3_db, axis=0))))
+            flicker4 = float(np.mean(np.abs(np.diff(mode4_db, axis=0))))
+            rough3 = float(np.mean(np.abs(np.diff(mode3_db, n=2, axis=1))))
+            rough4 = float(np.mean(np.abs(np.diff(mode4_db, n=2, axis=1))))
+            score = flicker4 + 0.6 * flicker3 + 0.2 * rough3 + 0.2 * rough4
+            if best_score is None or score < best_score:
+                best_score = score
+                best_offset = offset
+
+        return best_offset
+
+    def _resolve_db_limits(
+        self,
+        mode: SignalViewMode,
+        values: np.ndarray,
+        *,
+        configured_min: float | None,
+        configured_max: float | None,
+    ) -> tuple[float, float]:
+        """Resolve dB limits with headroom so peaks do not clip at the top."""
+        if configured_min is not None and configured_max is not None:
+            fixed_min = float(configured_min)
+            fixed_max = float(configured_max)
+            if fixed_max <= fixed_min + 1e-3:
+                fixed_max = fixed_min + 1.0
+            resolved = (fixed_min, fixed_max)
+            self._display_limits_by_mode[mode] = resolved
+            return resolved
+
+        source = np.asarray(values, dtype=np.float32)
+        auto_min, auto_max = self._stabilized_limits(mode, source)
+        target_min = auto_min if configured_min is None else float(configured_min)
+        target_max = auto_max if configured_max is None else float(configured_max)
+
+        if source.size > 0:
+            source_peak = float(np.percentile(source, 99.8))
+            required_top = source_peak + 2.5
+            if required_top > target_max:
+                target_max = required_top
+
+        if target_max <= target_min + 1e-3:
+            target_max = target_min + 1.0
+
+        previous = self._display_limits_by_mode.get(mode)
+        if previous is None:
+            resolved = (target_min, target_max)
+        else:
+            min_alpha = 0.20
+            max_alpha_up = 0.55
+            max_alpha_down = 0.08
+            new_min = previous[0] + min_alpha * (target_min - previous[0])
+            if target_max > previous[1]:
+                new_max = previous[1] + max_alpha_up * (target_max - previous[1])
+            else:
+                new_max = previous[1] + max_alpha_down * (target_max - previous[1])
+            if source.size > 0:
+                source_peak = float(np.percentile(source, 99.8))
+                required_top = source_peak + 2.5
+                if required_top > new_max:
+                    new_max = required_top
+            resolved = (new_min, new_max)
+
+        self._display_limits_by_mode[mode] = resolved
+        return resolved
+
+    def _stabilized_limits(
+        self, mode: SignalViewMode, values: np.ndarray
+    ) -> tuple[float, float]:
+        """Compute slowly adapting y-axis limits to avoid jittery autoscaling."""
+        source = np.asarray(values, dtype=np.float32)
+        if source.size == 0:
+            return 0.0, 1.0
+        current_min = float(np.percentile(source, 1.0))
+        current_max = float(np.percentile(source, 99.0))
+        if current_max - current_min < 1e-6:
+            center = float(np.mean(source))
+            current_min = center - 0.5
+            current_max = center + 0.5
+
+        previous = self._y_limits_by_mode.get(mode)
+        if previous is None:
+            limits = (current_min, current_max)
+        else:
+            alpha = 0.18
+            limits = (
+                previous[0] + alpha * (current_min - previous[0]),
+                previous[1] + alpha * (current_max - previous[1]),
+            )
+
+        self._y_limits_by_mode[mode] = limits
+        return limits
+
+    def _format_max_frequency_or_range(self, bin_count: int) -> str:
+        """Format the right-edge label for mode 3."""
         profile = self._profile_cfg
         if profile is None:
             return "Nyquist"
-        sample_rate_hz = profile.dig_out_sample_rate_ksps * 1_000.0
-        max_freq_hz = sample_rate_hz / 2.0
-        if max_freq_hz >= 1_000_000.0:
-            return f"{max_freq_hz / 1_000_000.0:.2f} MHz"
-        if max_freq_hz >= 1_000.0:
-            return f"{max_freq_hz / 1_000.0:.1f} kHz"
-        return f"{max_freq_hz:.0f} Hz"
+        return self._format_max_range(bin_count)
 
     def _format_max_range(self, bin_count: int) -> str:
         """Format the right-edge range axis label."""
@@ -391,6 +830,136 @@ class TerminalLiveDashboard:
         max_beat_hz = sample_rate_hz / 2.0
         max_range_m = C_M_PER_S * max_beat_hz / (2.0 * slope_hz_per_s)
         return f"{max_range_m:.2f} m"
+
+    def _alignment_status_label(self) -> str:
+        """Return compact alignment status for the dashboard subtitle."""
+        if not self._auto_alignment_enabled:
+            return str(int(self._processing.chirp_alignment_offset))
+        if self._resolved_chirp_alignment_offset is None:
+            return "auto(pending)"
+        return f"auto({self._resolved_chirp_alignment_offset})"
+
+    def _prediction_primary(self, prediction: LivePredictionResult | None) -> str:
+        """Return compact primary prediction text."""
+        if prediction is not None:
+            return prediction.primary
+        if self._prediction_error is not None:
+            return self._prediction_error
+        return "warming"
+
+    def _prediction_task(self, prediction: LivePredictionResult | None) -> str:
+        """Return compact prediction task text."""
+        if prediction is None:
+            return "-"
+        return prediction.task
+
+    def _prediction_confidence(self, prediction: LivePredictionResult | None) -> str:
+        """Return compact prediction confidence text."""
+        if prediction is None or prediction.confidence is None:
+            return "-"
+        return f"{prediction.confidence:.3f}"
+
+    def _prediction_detail(self, prediction: LivePredictionResult | None) -> str:
+        """Return compact prediction detail text."""
+        if prediction is None:
+            return "need frame"
+        return prediction.detail or "-"
+
+
+def _decode_dca_complex_words(
+    words: np.ndarray,
+    *,
+    decode_order: str = "iiqq",
+    q_first: bool = False,
+) -> np.ndarray:
+    """Decode complex int16 words from either IIQQ or IQIQ ordering."""
+    raw = np.asarray(words, dtype=np.float32)
+    if decode_order == "iiqq":
+        if raw.size < 4:
+            return np.zeros(0, dtype=np.complex64)
+        usable = (raw.size // 4) * 4
+        groups = raw[:usable].reshape(-1, 4)
+        i_values = groups[:, :2].reshape(-1)
+        q_values = groups[:, 2:].reshape(-1)
+        return (i_values + 1j * q_values).astype(np.complex64)
+
+    if decode_order == "iqiq":
+        if raw.size < 2:
+            return np.zeros(0, dtype=np.complex64)
+        usable = (raw.size // 2) * 2
+        pairs = raw[:usable].reshape(-1, 2)
+        if q_first:
+            q_values = pairs[:, 0]
+            i_values = pairs[:, 1]
+        else:
+            i_values = pairs[:, 0]
+            q_values = pairs[:, 1]
+        return (i_values + 1j * q_values).astype(np.complex64)
+
+    raise ValueError(f"Unsupported decode_order: {decode_order}")
+
+
+def _magnitude_to_db(
+    values: np.ndarray, *, normalize_to_peak: bool = False, floor_db: float = -120.0
+) -> np.ndarray:
+    """Convert linear magnitude to dB, optionally normalized to the current peak."""
+    magnitude = np.asarray(values, dtype=np.float32)
+    db = 20.0 * np.log10(np.maximum(magnitude, 1e-9))
+    if normalize_to_peak:
+        peak = float(np.max(magnitude)) if magnitude.size else 0.0
+        if peak > 1e-9:
+            db -= 20.0 * np.log10(peak)
+    db = np.maximum(db, floor_db)
+    return db.astype(np.float32)
+
+
+def _power_to_db(
+    values: np.ndarray, *, normalize_to_peak: bool = False, floor_db: float = -120.0
+) -> np.ndarray:
+    """Convert linear power to dB, optionally normalized to the current peak."""
+    power = np.asarray(values, dtype=np.float32)
+    db = 10.0 * np.log10(np.maximum(power, 1e-9))
+    if normalize_to_peak:
+        peak = float(np.max(power)) if power.size else 0.0
+        if peak > 1e-9:
+            db -= 10.0 * np.log10(peak)
+    db = np.maximum(db, floor_db)
+    return db.astype(np.float32)
+
+
+def _select_range_side(values: np.ndarray, *, side: str) -> np.ndarray:
+    """Select positive or negative range side from full complex-FFT bins."""
+    data = np.asarray(values)
+    if side == "full":
+        return data
+    count = data.shape[-1]
+    half = max(1, count // 2)
+    if side == "positive":
+        return data[..., :half]
+    if side == "negative":
+        return data[..., half:]
+    raise ValueError(f"Unsupported range side: {side}")
+
+
+def _parse_chirps_per_frame(cfg: RadarCliConfig) -> int | None:
+    """Parse chirps per frame from frameCfg, if present."""
+    line = cfg.find_first("frameCfg")
+    if line is None:
+        return None
+    parts = line.text.split()
+    if len(parts) < 4:
+        return None
+    try:
+        chirp_start_idx = int(parts[1])
+        chirp_end_idx = int(parts[2])
+        num_loops = int(parts[3])
+    except ValueError:
+        return None
+    chirps_per_loop = chirp_end_idx - chirp_start_idx + 1
+    chirps_per_frame = chirps_per_loop * num_loops
+    if chirps_per_frame <= 0:
+        return None
+    return chirps_per_frame
 
 
 def _format_bytes(value: float) -> str:
@@ -475,6 +1044,9 @@ def _render_line_plot(series: PlotSeries, *, width: int, height: int) -> Panel:
 
     minimum = float(np.min(values)) if values.size else 0.0
     maximum = float(np.max(values)) if values.size else 0.0
+    if series.y_min is not None and series.y_max is not None:
+        minimum = float(series.y_min)
+        maximum = float(series.y_max)
     span = maximum - minimum
     if span <= 1e-9:
         normalized = np.full(values.shape, 0.5, dtype=np.float32)
@@ -487,11 +1059,11 @@ def _render_line_plot(series: PlotSeries, *, width: int, height: int) -> Panel:
         x = min(subpixel_width - 1, index)
         y = min(
             subpixel_height - 1,
-            max(0, int(round((1.0 - float(fraction)) * (subpixel_height - 1)))),
+            max(0, round((1.0 - float(fraction)) * (subpixel_height - 1))),
         )
         points.append((x, y))
 
-    for start, end in zip(points, points[1:]):
+    for start, end in pairwise(points):
         _draw_bitmap_line(bitmap, start[0], start[1], end[0], end[1])
 
     rendered_lines: list[Text] = []
@@ -574,6 +1146,8 @@ def _braille_cell(bitmap: list[list[bool]], origin_x: int, origin_y: int) -> str
 
 __all__ = [
     "LiveMetrics",
+    "LivePredictionResult",
+    "LiveSignalProcessingConfig",
     "PlotSeries",
     "SignalViewMode",
     "TerminalLiveDashboard",

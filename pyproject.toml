@@ -33,9 +33,21 @@ dev = [
     "ruff>=0.11.0",
     "mypy>=1.15.0",
 ]
+ml = [
+    "torch>=2.11.0",
+]
 
 [project.scripts]
 mmw = "mmwave_radar_devtool.cli:main"
+mmw-train-classifier = "mmwave_radar_devtool.ml.train_classification:main"
+mmw-train-regressor = "mmwave_radar_devtool.ml.train_regression:main"
+mmw-predict = "mmwave_radar_devtool.ml.predict:main"
+mmw-evaluate-classifier = "mmwave_radar_devtool.ml.evaluate_classification:main"
+mmw-evaluate-regressor-preds = "mmwave_radar_devtool.ml.evaluate_regression_predictions:main"
+mmw-run-experiments = "mmwave_radar_devtool.ml.run_experiments:main"
+mmw-plot-experiments = "mmwave_radar_devtool.ml.plot_experiments:main"
+mmw-visualize-bin = "mmwave_radar_devtool.ml.visualize_bin:main"
+mmw-visualize-dataset = "mmwave_radar_devtool.ml.visualize_dataset:main"
 
 [build-system]
 requires = ["hatchling>=1.27.0"]
