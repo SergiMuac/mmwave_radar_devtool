@@ -1,485 +1,402 @@
-
 from __future__ import annotations
 
 import argparse
-import math
-from dataclasses import dataclass
+import json
+from dataclasses import replace
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-C_M_PER_S: float = 299_792_458.0
-
-
-@dataclass(frozen=True)
-class RadarConfig:
-    """Radar capture parameters required to reshape and interpret raw samples."""
-
-    num_rx: int
-    num_tx: int
-    samples_per_chirp: int
-    chirps_per_frame: int
-    frame_period_ms: float | None
-    adc_sample_rate_ksps: float | None
-    freq_slope_mhz_per_us: float | None
-    start_freq_ghz: float | None
-    idle_time_us: float | None
-    ramp_end_time_us: float | None
-    complex_iq: bool = True
-
-    @property
-    def adc_sample_rate_hz(self) -> float | None:
-        """Return the ADC sample rate in Hz."""
-        if self.adc_sample_rate_ksps is None:
-            return None
-        return self.adc_sample_rate_ksps * 1_000.0
-
-    @property
-    def freq_slope_hz_per_s(self) -> float | None:
-        """Return the FMCW slope in Hz/s."""
-        if self.freq_slope_mhz_per_us is None:
-            return None
-        return self.freq_slope_mhz_per_us * 1e12
+from mmwave_radar_devtool.range_profile_dataset import (
+    RadarTensorConfig,
+    compute_range_axis_m,
+    create_training_inputs,
+    detect_target_bin_candidates,
+    parse_tensor_cfg,
+    plot_range_doppler_heatmap,
+    plot_range_profile_slice,
+    plot_zero_doppler_average,
+    process_capture,
+    select_useful_range_side,
+    validate_capture_layout,
+)
 
 
-def _enabled_rx_count(mask: int) -> int:
-    """Count enabled receiver channels from a bit mask."""
-    return int(bin(mask & 0xF).count("1"))
-
-
-def _enabled_tx_count(mask: int) -> int:
-    """Count enabled transmitter channels from a bit mask."""
-    return int(bin(mask & 0x7).count("1"))
-
-
-def parse_cfg(path: Path) -> RadarConfig:
-    """Parse a TI mmWave cfg file and extract the key acquisition parameters."""
-    rx_mask: int | None = None
-    tx_mask: int | None = None
-    samples_per_chirp: int | None = None
-    adc_sample_rate_ksps: float | None = None
-    freq_slope_mhz_per_us: float | None = None
-    start_freq_ghz: float | None = None
-    idle_time_us: float | None = None
-    ramp_end_time_us: float | None = None
-    chirps_per_frame: int | None = None
-    frame_period_ms: float | None = None
-
-    chirp_tx_masks: list[int] = []
-
-    for raw_line in path.read_text(encoding="ascii", errors="ignore").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("%"):
-            continue
-
-        parts = line.split()
-        command = parts[0]
-
-        if command == "channelCfg" and len(parts) >= 3:
-            rx_mask = int(parts[1])
-            tx_mask = int(parts[2])
-
-        elif command == "profileCfg" and len(parts) >= 12:
-            start_freq_ghz = float(parts[2])
-            idle_time_us = float(parts[3])
-            ramp_end_time_us = float(parts[5])
-            freq_slope_mhz_per_us = float(parts[8])
-            samples_per_chirp = int(parts[10])
-            adc_sample_rate_ksps = float(parts[11])
-
-        elif command == "chirpCfg" and len(parts) >= 9:
-            chirp_tx_masks.append(int(parts[8]))
-
-        elif command == "frameCfg" and len(parts) >= 7:
-            start_idx = int(parts[1])
-            end_idx = int(parts[2])
-            loops = int(parts[3])
-            frame_period_ms = float(parts[5])
-            chirps_per_loop = end_idx - start_idx + 1
-            chirps_per_frame = chirps_per_loop * loops
-
-    inferred_tx = max((_enabled_tx_count(mask) for mask in chirp_tx_masks), default=0)
-    num_tx = inferred_tx or (_enabled_tx_count(tx_mask) if tx_mask is not None else 3)
-    num_rx = _enabled_rx_count(rx_mask) if rx_mask is not None else 4
-
-    if samples_per_chirp is None:
-        raise ValueError("Could not infer samples_per_chirp from cfg.")
-    if chirps_per_frame is None:
-        raise ValueError("Could not infer chirps_per_frame from cfg.")
-
-    return RadarConfig(
-        num_rx=num_rx,
-        num_tx=max(1, num_tx),
-        samples_per_chirp=samples_per_chirp,
-        chirps_per_frame=chirps_per_frame,
-        frame_period_ms=frame_period_ms,
-        adc_sample_rate_ksps=adc_sample_rate_ksps,
-        freq_slope_mhz_per_us=freq_slope_mhz_per_us,
-        start_freq_ghz=start_freq_ghz,
-        idle_time_us=idle_time_us,
-        ramp_end_time_us=ramp_end_time_us,
-        complex_iq=True,
+def _default_tensor_config() -> RadarTensorConfig:
+    """Return the default xWR18xx tensor configuration from this project context."""
+    return RadarTensorConfig(
+        chirps_per_frame=16,
+        num_rx=4,
+        num_tx=1,
+        num_adc_samples=256,
+        adc_sample_rate_ksps=6000.0,
+        freq_slope_mhz_per_us=80.0,
+        start_freq_ghz=77.0,
+        idle_time_us=10.0,
+        ramp_end_time_us=50.0,
     )
 
 
-def build_config_from_args(args: argparse.Namespace) -> RadarConfig:
-    """Create a RadarConfig from either cfg parsing or explicit CLI values."""
-    if args.cfg is not None:
-        parsed = parse_cfg(args.cfg)
-        return RadarConfig(
-            num_rx=args.num_rx or parsed.num_rx,
-            num_tx=args.num_tx or parsed.num_tx,
-            samples_per_chirp=args.samples_per_chirp or parsed.samples_per_chirp,
-            chirps_per_frame=args.chirps_per_frame or parsed.chirps_per_frame,
-            frame_period_ms=args.frame_period_ms if args.frame_period_ms is not None else parsed.frame_period_ms,
-            adc_sample_rate_ksps=args.adc_sample_rate_ksps if args.adc_sample_rate_ksps is not None else parsed.adc_sample_rate_ksps,
-            freq_slope_mhz_per_us=args.freq_slope_mhz_per_us if args.freq_slope_mhz_per_us is not None else parsed.freq_slope_mhz_per_us,
-            start_freq_ghz=args.start_freq_ghz if args.start_freq_ghz is not None else parsed.start_freq_ghz,
-            idle_time_us=args.idle_time_us if args.idle_time_us is not None else parsed.idle_time_us,
-            ramp_end_time_us=args.ramp_end_time_us if args.ramp_end_time_us is not None else parsed.ramp_end_time_us,
-            complex_iq=not args.real_only,
-        )
+def _resolve_config(args: argparse.Namespace) -> RadarTensorConfig:
+    """Build the tensor configuration from cfg and optional overrides."""
+    cfg = parse_tensor_cfg(args.cfg) if args.cfg is not None else _default_tensor_config()
 
-    required = (
-        args.num_rx,
-        args.samples_per_chirp,
-        args.chirps_per_frame,
-    )
-    if any(value is None for value in required):
-        raise ValueError(
-            "Without --cfg, the following arguments are required: "
-            "--num-rx, --samples-per-chirp, --chirps-per-frame."
-        )
+    updates = {}
+    if args.chirps_per_frame is not None:
+        updates["chirps_per_frame"] = args.chirps_per_frame
+    if args.num_rx is not None:
+        updates["num_rx"] = args.num_rx
+    if args.num_tx is not None:
+        updates["num_tx"] = args.num_tx
+    if args.num_adc_samples is not None:
+        updates["num_adc_samples"] = args.num_adc_samples
+    if args.adc_sample_rate_ksps is not None:
+        updates["adc_sample_rate_ksps"] = args.adc_sample_rate_ksps
+    if args.freq_slope_mhz_per_us is not None:
+        updates["freq_slope_mhz_per_us"] = args.freq_slope_mhz_per_us
+    if args.start_freq_ghz is not None:
+        updates["start_freq_ghz"] = args.start_freq_ghz
+    if args.idle_time_us is not None:
+        updates["idle_time_us"] = args.idle_time_us
+    if args.ramp_end_time_us is not None:
+        updates["ramp_end_time_us"] = args.ramp_end_time_us
 
-    return RadarConfig(
-        num_rx=int(args.num_rx),
-        num_tx=int(args.num_tx or 1),
-        samples_per_chirp=int(args.samples_per_chirp),
-        chirps_per_frame=int(args.chirps_per_frame),
-        frame_period_ms=args.frame_period_ms,
-        adc_sample_rate_ksps=args.adc_sample_rate_ksps,
-        freq_slope_mhz_per_us=args.freq_slope_mhz_per_us,
-        start_freq_ghz=args.start_freq_ghz,
-        idle_time_us=args.idle_time_us,
-        ramp_end_time_us=args.ramp_end_time_us,
-        complex_iq=not args.real_only,
-    )
-
-
-def load_raw_capture(path: Path, config: RadarConfig) -> np.ndarray:
-    """Load a raw DCA1000-like capture and reshape it as [frame, chirp, rx, sample]."""
-    raw = np.fromfile(path, dtype=np.int16)
-    if raw.size == 0:
-        raise ValueError("The input .bin file is empty.")
-
-    if config.complex_iq:
-        if raw.size % 2 != 0:
-            raw = raw[:-1]
-        raw_complex = raw[0::2].astype(np.float32) + 1j * raw[1::2].astype(np.float32)
-    else:
-        raw_complex = raw.astype(np.float32).astype(np.complex64)
-
-    samples_per_chirp_all_rx = config.samples_per_chirp * config.num_rx
-    chirps_per_frame = config.chirps_per_frame
-    frame_size = samples_per_chirp_all_rx * chirps_per_frame
-
-    usable = (raw_complex.size // frame_size) * frame_size
-    if usable == 0:
-        raise ValueError(
-            "The file is too small to form even one full frame with the provided configuration."
-        )
-
-    raw_complex = raw_complex[:usable]
-    frames = raw_complex.reshape((-1, chirps_per_frame, config.num_rx, config.samples_per_chirp))
-    return frames
-
-
-def _range_bin_count(config: RadarConfig) -> int:
-    """Return the number of bins in the range spectrum for the configured sample mode."""
-    if config.complex_iq:
-        return config.samples_per_chirp
-    return (config.samples_per_chirp // 2) + 1
-
-
-def compute_range_axis_m(frames: np.ndarray, config: RadarConfig) -> np.ndarray | None:
-    """Compute the range axis in meters for a range FFT."""
-    if config.adc_sample_rate_hz is None or config.freq_slope_hz_per_s is None:
-        return None
-
-    num_samples = frames.shape[-1]
-    if config.complex_iq:
-        freqs = np.fft.fftfreq(num_samples, d=1.0 / config.adc_sample_rate_hz)
-        positive = freqs >= 0.0
-        freqs = freqs[positive]
-    else:
-        freqs = np.fft.rfftfreq(num_samples, d=1.0 / config.adc_sample_rate_hz)
-    ranges = (C_M_PER_S * freqs) / (2.0 * config.freq_slope_hz_per_s)
-    return ranges
-
-
-def average_raw_by_rx(frames: np.ndarray) -> np.ndarray:
-    """Return a representative time-domain waveform per RX averaged over frames and chirps."""
-    mean_chirp = frames.mean(axis=(0, 1))
-    return mean_chirp
-
-
-def average_intensity_by_rx(frames: np.ndarray) -> np.ndarray:
-    """Return a representative magnitude envelope per RX."""
-    return np.abs(frames).mean(axis=(0, 1))
-
-
-def _range_fft_last_axis(data: np.ndarray, complex_iq: bool) -> np.ndarray:
-    """Compute a range FFT across the last axis and keep non-negative bins."""
-    if complex_iq:
-        spectrum = np.fft.fft(data, axis=-1)
-        positive_bins = spectrum[..., : spectrum.shape[-1] // 2]
-        return positive_bins
-    return np.fft.rfft(data, axis=-1)
-
-
-def average_spectrum_by_rx(frames: np.ndarray, config: RadarConfig) -> np.ndarray:
-    """Return the average magnitude spectrum per RX."""
-    window = np.hanning(frames.shape[-1]).astype(np.float32)
-    windowed = frames * window[None, None, None, :]
-    spectrum = _range_fft_last_axis(windowed, config.complex_iq)
-    magnitude = np.abs(spectrum)
-    return magnitude.mean(axis=(0, 1))
-
-
-def average_range_profile_by_rx(frames: np.ndarray, config: RadarConfig) -> np.ndarray:
-    """Return the average range FFT magnitude per RX."""
-    return average_spectrum_by_rx(frames, config)
-
-
-def compute_range_doppler(frames: np.ndarray, rx_index: int, config: RadarConfig) -> np.ndarray:
-    """Compute a simple range-Doppler magnitude map for one RX channel."""
-    rx_cube = frames[:, :, rx_index, :]
-    flattened = rx_cube.reshape((-1, rx_cube.shape[-1]))
-    window_range = np.hanning(flattened.shape[-1]).astype(np.float32)
-    range_fft = _range_fft_last_axis(flattened * window_range[None, :], config.complex_iq)
-
-    window_doppler = np.hanning(range_fft.shape[0]).astype(np.float32)
-    doppler_in = range_fft * window_doppler[:, None]
-    rd = np.fft.fftshift(np.fft.fft(doppler_in, axis=0), axes=0)
-    return np.abs(rd)
-
-
-def _make_output_dir(path: Path | None) -> Path | None:
-    """Create the output directory when needed."""
-    if path is None:
-        return None
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _save_or_show(fig: plt.Figure, output_dir: Path | None, filename: str, show: bool) -> None:
-    """Save a figure and optionally display it."""
-    if output_dir is not None:
-        fig.savefig(output_dir / filename, dpi=160, bbox_inches="tight")
-    if show:
-        plt.show(block=False)
-    else:
-        plt.close(fig)
-
-
-def plot_rx_lines(
-    x: np.ndarray,
-    y_by_rx: np.ndarray,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    output_dir: Path | None,
-    filename: str,
-    show: bool,
-) -> None:
-    """Plot one line per RX channel."""
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for rx_index in range(y_by_rx.shape[0]):
-        ax.plot(x, y_by_rx[rx_index], linewidth=1.25, label=f"RX{rx_index + 1}")
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    _save_or_show(fig, output_dir, filename, show)
-
-
-def plot_combined_line(
-    x: np.ndarray,
-    y: np.ndarray,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    output_dir: Path | None,
-    filename: str,
-    show: bool,
-) -> None:
-    """Plot a single combined line."""
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(x, y, linewidth=1.4)
-    ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
-    _save_or_show(fig, output_dir, filename, show)
-
-
-def plot_range_doppler_map(
-    rd_map: np.ndarray,
-    output_dir: Path | None,
-    filename: str,
-    show: bool,
-) -> None:
-    """Plot a range-Doppler magnitude heatmap."""
-    fig, ax = plt.subplots(figsize=(12, 7))
-    log_rd = 20.0 * np.log10(rd_map + 1e-9)
-    image = ax.imshow(log_rd, aspect="auto", origin="lower")
-    ax.set_title("Range-Doppler map")
-    ax.set_xlabel("Range bin")
-    ax.set_ylabel("Doppler bin")
-    fig.colorbar(image, ax=ax, label="Magnitude (dB)")
-    _save_or_show(fig, output_dir, filename, show)
-
-
-def describe_config(config: RadarConfig, frames: np.ndarray) -> str:
-    """Build a textual summary of the interpreted capture layout."""
-    return "\n".join(
-        [
-            "Capture summary",
-            f"  frames: {frames.shape[0]}",
-            f"  chirps_per_frame: {frames.shape[1]}",
-            f"  num_rx: {frames.shape[2]}",
-            f"  samples_per_chirp: {frames.shape[3]}",
-            f"  num_tx_cfg: {config.num_tx}",
-            f"  adc_sample_rate_ksps: {config.adc_sample_rate_ksps}",
-            f"  freq_slope_mhz_per_us: {config.freq_slope_mhz_per_us}",
-            f"  frame_period_ms: {config.frame_period_ms}",
-        ]
-    )
+    if updates:
+        cfg = replace(cfg, **updates)
+    return cfg
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Visualize a raw radar .bin capture as waveform, intensity, spectrum, "
-            "range profile, and range-Doppler views."
+            "Process TI xWR18xx/xWR68xx DCA1000 raw ADC captures into range-profile "
+            "tensors for model training."
         )
     )
-    parser.add_argument("bin_file", type=Path, help="Path to the raw .bin capture file.")
-    parser.add_argument("--cfg", type=Path, default=None, help="Optional TI cfg file for automatic parameter extraction.")
-    parser.add_argument("--num-rx", type=int, default=None, help="Number of enabled RX channels.")
-    parser.add_argument("--num-tx", type=int, default=None, help="Number of TX channels implied by the capture pattern.")
-    parser.add_argument("--samples-per-chirp", type=int, default=None, help="ADC samples per chirp.")
-    parser.add_argument("--chirps-per-frame", type=int, default=None, help="Number of chirps per frame.")
-    parser.add_argument("--frame-period-ms", type=float, default=None, help="Frame period in milliseconds.")
-    parser.add_argument("--adc-sample-rate-ksps", type=float, default=None, help="ADC sampling rate in ksps.")
-    parser.add_argument("--freq-slope-mhz-per-us", type=float, default=None, help="Chirp frequency slope in MHz/us.")
-    parser.add_argument("--start-freq-ghz", type=float, default=None, help="Start frequency in GHz.")
-    parser.add_argument("--idle-time-us", type=float, default=None, help="Idle time in microseconds.")
-    parser.add_argument("--ramp-end-time-us", type=float, default=None, help="Ramp end time in microseconds.")
-    parser.add_argument("--real-only", action="store_true", help="Treat the capture as real samples instead of interleaved I/Q.")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Optional directory to save plots as PNG files.")
-    parser.add_argument("--no-show", action="store_true", help="Do not display figures interactively.")
-    parser.add_argument("--rx-for-rd", type=int, default=1, help="Receiver channel to use for the range-Doppler map, 1-based.")
+    parser.add_argument(
+        "object_capture",
+        nargs="?",
+        type=Path,
+        default=Path("object_capture.bin"),
+        help="Path to object capture .bin (default: object_capture.bin).",
+    )
+    parser.add_argument(
+        "--empty-capture",
+        type=Path,
+        default=None,
+        help="Optional empty/background capture .bin for subtraction.",
+    )
+    parser.add_argument(
+        "--baseline-open-capture",
+        type=Path,
+        default=None,
+        help=(
+            "Optional no-attenuation baseline .bin. "
+            "When provided, saves delta tensors/plots versus this baseline."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-blocked-capture",
+        type=Path,
+        default=None,
+        help=(
+            "Optional max-attenuation baseline .bin. "
+            "When provided, saves delta tensors/plots versus this baseline."
+        ),
+    )
+    parser.add_argument(
+        "--cfg",
+        type=Path,
+        default=Path("config/xwr18xx_profile_raw_capture.cfg"),
+        help="TI cfg used to derive tensor dimensions and profile parameters.",
+    )
+    parser.add_argument("--chirps-per-frame", type=int, default=None)
+    parser.add_argument("--num-rx", type=int, default=None)
+    parser.add_argument("--num-tx", type=int, default=None)
+    parser.add_argument("--num-adc-samples", type=int, default=None)
+    parser.add_argument("--adc-sample-rate-ksps", type=float, default=None)
+    parser.add_argument("--freq-slope-mhz-per-us", type=float, default=None)
+    parser.add_argument("--start-freq-ghz", type=float, default=None)
+    parser.add_argument("--idle-time-us", type=float, default=None)
+    parser.add_argument("--ramp-end-time-us", type=float, default=None)
+    parser.add_argument("--window-kind", choices=["hann", "rect"], default="hann")
+    parser.add_argument("--window-frames", type=int, default=None)
+    parser.add_argument("--window-step", type=int, default=1)
+    parser.add_argument("--target-m", type=float, default=0.4)
+    parser.add_argument("--frame-for-plots", type=int, default=0)
+    parser.add_argument(
+        "--useful-side",
+        choices=["full", "positive", "negative"],
+        default="full",
+        help="Select positive/negative FFT half after inspection for NN output.",
+    )
+    parser.add_argument("--eps", type=float, default=1e-9)
+    parser.add_argument("--output-dir", type=Path, default=Path("."))
     return parser.parse_args()
 
 
+def _select_range_axis_side(range_axis_m: np.ndarray, *, side: str) -> np.ndarray:
+    """Select range-axis half matching useful-side selection."""
+    if side == "positive":
+        return range_axis_m[: range_axis_m.shape[0] // 2]
+    if side == "negative":
+        return range_axis_m[range_axis_m.shape[0] // 2 :]
+    return range_axis_m
+
+
+def _delta_against_baseline(object_logmag: np.ndarray, baseline_logmag: np.ndarray) -> np.ndarray:
+    """Subtract baseline mean frame from object tensor."""
+    baseline_mean = np.mean(np.asarray(baseline_logmag, dtype=np.float32), axis=0, keepdims=True)
+    return (np.asarray(object_logmag, dtype=np.float32) - baseline_mean).astype(np.float32)
+
+
+def _plot_baseline_delta_profiles(
+    *,
+    delta_vs_open: np.ndarray | None,
+    delta_vs_blocked: np.ndarray | None,
+    output_path: Path,
+    range_axis_m: np.ndarray | None,
+) -> None:
+    """Plot side-by-side average delta profiles for baseline comparisons."""
+    traces: list[tuple[str, np.ndarray]] = []
+    if delta_vs_open is not None:
+        open_profile = np.mean(delta_vs_open, axis=(0, 1, 2), dtype=np.float32)
+        traces.append(
+            ("Delta vs no-attenuation baseline", open_profile)
+        )
+    if delta_vs_blocked is not None:
+        traces.append(
+            (
+                "Delta vs max-attenuation baseline",
+                np.mean(delta_vs_blocked, axis=(0, 1, 2), dtype=np.float32),
+            )
+        )
+    if not traces:
+        return
+
+    fig, axes = plt.subplots(
+        1,
+        len(traces),
+        figsize=(7 * len(traces), 5),
+        squeeze=False,
+        sharey=True,
+    )
+    x_label = "Range FFT Bin"
+    for idx, (title, y_values) in enumerate(traces):
+        x = np.arange(y_values.size, dtype=np.float32)
+        if range_axis_m is not None and range_axis_m.shape[0] == y_values.size:
+            x = range_axis_m.astype(np.float32)
+            x_label = "Range (m)"
+        ax = axes[0, idx]
+        ax.plot(x, y_values, linewidth=1.4)
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=0.9, alpha=0.7)
+        ax.set_title(title)
+        ax.set_xlabel(x_label)
+        if idx == 0:
+            ax.set_ylabel("Delta log-magnitude (dB)")
+        ax.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
-    """Run the offline radar capture visualizer."""
+    """Example entry point producing .npy tensors and debug plots."""
     args = parse_args()
-    config = build_config_from_args(args)
-    frames = load_raw_capture(args.bin_file, config)
-    output_dir = _make_output_dir(args.output_dir)
-    show = not args.no_show
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(describe_config(config, frames))
+    cfg = _resolve_config(args)
 
-    raw_by_rx = average_raw_by_rx(frames)
-    intensity_by_rx = average_intensity_by_rx(frames)
-    spectrum_by_rx = average_spectrum_by_rx(frames, config)
-    range_by_rx = average_range_profile_by_rx(frames, config)
+    print("Tensor config")
+    print(f"  chirps_per_frame={cfg.chirps_per_frame}")
+    print(f"  num_rx={cfg.num_rx}")
+    print(f"  num_tx={cfg.num_tx}")
+    print(f"  num_adc_samples={cfg.num_adc_samples}")
+    print(f"  adc_sample_rate_ksps={cfg.adc_sample_rate_ksps}")
+    print(f"  freq_slope_mhz_per_us={cfg.freq_slope_mhz_per_us}")
+    print(f"  expected_bytes_per_frame={cfg.bytes_per_frame}")
 
-    raw_x = np.arange(config.samples_per_chirp)
-    plot_rx_lines(
-        x=raw_x,
-        y_by_rx=raw_by_rx.real,
-        title="Raw waveform by RX channel",
-        xlabel="Sample index",
-        ylabel="Amplitude (I component)",
-        output_dir=output_dir,
-        filename="raw_waveform_by_rx.png",
-        show=show,
+    validate_capture_layout(args.object_capture, cfg)
+    object_data = process_capture(
+        args.object_capture,
+        cfg,
+        window_kind=args.window_kind,
+        eps=args.eps,
     )
 
-    plot_rx_lines(
-        x=raw_x,
-        y_by_rx=intensity_by_rx,
-        title="Intensity envelope by RX channel",
-        xlabel="Sample index",
-        ylabel="Magnitude",
-        output_dir=output_dir,
-        filename="intensity_by_rx.png",
-        show=show,
+    empty_data = None
+    if args.empty_capture is not None:
+        validate_capture_layout(args.empty_capture, cfg)
+        empty_data = process_capture(
+            args.empty_capture,
+            cfg,
+            window_kind=args.window_kind,
+            eps=args.eps,
+        )
+
+    baseline_open_data = None
+    if args.baseline_open_capture is not None:
+        validate_capture_layout(args.baseline_open_capture, cfg)
+        baseline_open_data = process_capture(
+            args.baseline_open_capture,
+            cfg,
+            window_kind=args.window_kind,
+            eps=args.eps,
+        )
+
+    baseline_blocked_data = None
+    if args.baseline_blocked_capture is not None:
+        validate_capture_layout(args.baseline_blocked_capture, cfg)
+        baseline_blocked_data = process_capture(
+            args.baseline_blocked_capture,
+            cfg,
+            window_kind=args.window_kind,
+            eps=args.eps,
+        )
+
+    zero_doppler_db = object_data.zero_doppler_db
+    rd_heatmap = object_data.range_doppler_power_shifted
+
+    # Optional side selection for full-complex FFT bins.
+    object_logmag_for_nn = object_data.log_magnitude_db
+    empty_logmag_for_nn = empty_data.log_magnitude_db if empty_data is not None else None
+    baseline_open_logmag = (
+        baseline_open_data.log_magnitude_db if baseline_open_data is not None else None
+    )
+    baseline_blocked_logmag = (
+        baseline_blocked_data.log_magnitude_db if baseline_blocked_data is not None else None
+    )
+    if args.useful_side != "full":
+        object_logmag_for_nn = select_useful_range_side(
+            object_logmag_for_nn, side=args.useful_side
+        )
+        if empty_logmag_for_nn is not None:
+            empty_logmag_for_nn = select_useful_range_side(
+                empty_logmag_for_nn, side=args.useful_side
+            )
+        if baseline_open_logmag is not None:
+            baseline_open_logmag = select_useful_range_side(
+                baseline_open_logmag, side=args.useful_side
+            )
+        if baseline_blocked_logmag is not None:
+            baseline_blocked_logmag = select_useful_range_side(
+                baseline_blocked_logmag, side=args.useful_side
+            )
+
+    nn_logmag_windows = create_training_inputs(
+        object_logmag_for_nn,
+        empty_logmag=empty_logmag_for_nn,
+        window_frames=args.window_frames,
+        window_step=args.window_step,
     )
 
-    spectrum_x = np.arange(spectrum_by_rx.shape[-1])
-    plot_rx_lines(
-        x=spectrum_x,
-        y_by_rx=20.0 * np.log10(spectrum_by_rx + 1e-9),
-        title="Beat spectrum by RX channel",
-        xlabel="Frequency bin",
-        ylabel="Magnitude (dB)",
-        output_dir=output_dir,
-        filename="spectrum_by_rx.png",
-        show=show,
+    delta_vs_open = None
+    if baseline_open_logmag is not None:
+        delta_vs_open = _delta_against_baseline(object_logmag_for_nn, baseline_open_logmag)
+
+    delta_vs_blocked = None
+    if baseline_blocked_logmag is not None:
+        delta_vs_blocked = _delta_against_baseline(object_logmag_for_nn, baseline_blocked_logmag)
+
+    np.save(output_dir / "range_profile_zero_doppler.npy", zero_doppler_db)
+    np.save(output_dir / "range_doppler_heatmap.npy", rd_heatmap)
+    np.save(output_dir / "nn_logmag_windows.npy", nn_logmag_windows)
+    if delta_vs_open is not None:
+        np.save(output_dir / "delta_vs_open_baseline_logmag.npy", delta_vs_open)
+    if delta_vs_blocked is not None:
+        np.save(output_dir / "delta_vs_blocked_baseline_logmag.npy", delta_vs_blocked)
+
+    # Debug plots
+    plot_frame = max(0, min(args.frame_for_plots, object_data.range_cube.shape[0] - 1))
+    plot_range_profile_slice(
+        object_data.range_cube,
+        frame_idx=plot_frame,
+        chirp_idx=0,
+        rx_idx=0,
+        output_path=output_dir / "debug_range_profile_slice.png",
+        eps=args.eps,
     )
 
-    range_axis_m = compute_range_axis_m(frames, config)
-    if range_axis_m is None:
-        range_x = np.arange(range_by_rx.shape[-1])
-        range_xlabel = "Range bin"
-    else:
-        range_x = range_axis_m
-        range_xlabel = "Range (m)"
-
-    plot_rx_lines(
-        x=range_x,
-        y_by_rx=20.0 * np.log10(range_by_rx + 1e-9),
-        title="Range profile by RX channel",
-        xlabel=range_xlabel,
-        ylabel="Magnitude (dB)",
-        output_dir=output_dir,
-        filename="range_profile_by_rx.png",
-        show=show,
+    range_axis_m = compute_range_axis_m(cfg)
+    selected_range_axis = _select_range_axis_side(range_axis_m, side=args.useful_side)
+    plot_zero_doppler_average(
+        zero_doppler_db,
+        output_path=output_dir / "debug_zero_doppler_profile_avg.png",
+        range_axis_m=range_axis_m,
     )
 
-    combined_range = range_by_rx.mean(axis=0)
-    plot_combined_line(
-        x=range_x,
-        y=20.0 * np.log10(combined_range + 1e-9),
-        title="Combined range profile",
-        xlabel=range_xlabel,
-        ylabel="Magnitude (dB)",
-        output_dir=output_dir,
-        filename="range_profile_combined.png",
-        show=show,
+    plot_range_doppler_heatmap(
+        object_data.range_doppler_power_unshifted,
+        frame_idx=plot_frame,
+        output_path=output_dir / "debug_range_doppler_unshifted.png",
+        eps=args.eps,
+    )
+    plot_range_doppler_heatmap(
+        object_data.range_doppler_power_shifted,
+        frame_idx=plot_frame,
+        output_path=output_dir / "debug_range_doppler_shifted.png",
+        eps=args.eps,
     )
 
-    rx_for_rd = max(1, min(args.rx_for_rd, config.num_rx)) - 1
-    rd_map = compute_range_doppler(frames, rx_for_rd, config)
-    plot_range_doppler_map(
-        rd_map=rd_map,
-        output_dir=output_dir,
-        filename=f"range_doppler_rx{rx_for_rd + 1}.png",
-        show=show,
+    # Target-bin inspection utility around 40 cm by default.
+    mean_zero_doppler = np.mean(zero_doppler_db, axis=0)
+    target_report = detect_target_bin_candidates(
+        mean_zero_doppler,
+        cfg,
+        target_m=args.target_m,
+        search_radius=2,
+    )
+    (output_dir / "target_bin_report.json").write_text(
+        json.dumps(target_report, indent=2),
+        encoding="utf-8",
     )
 
-    if show:
-        plt.show()
+    delta_plot_path = output_dir / "debug_delta_baseline_profiles.png"
+    _plot_baseline_delta_profiles(
+        delta_vs_open=delta_vs_open,
+        delta_vs_blocked=delta_vs_blocked,
+        output_path=delta_plot_path,
+        range_axis_m=selected_range_axis,
+    )
+
+    delta_summary = {
+        "useful_side": args.useful_side,
+        "has_open_baseline": delta_vs_open is not None,
+        "has_blocked_baseline": delta_vs_blocked is not None,
+    }
+    if delta_vs_open is not None:
+        delta_summary["delta_vs_open_mean_db"] = float(np.mean(delta_vs_open))
+        delta_summary["delta_vs_open_std_db"] = float(np.std(delta_vs_open))
+    if delta_vs_blocked is not None:
+        delta_summary["delta_vs_blocked_mean_db"] = float(np.mean(delta_vs_blocked))
+        delta_summary["delta_vs_blocked_std_db"] = float(np.std(delta_vs_blocked))
+    if delta_vs_open is not None or delta_vs_blocked is not None:
+        (output_dir / "delta_baseline_summary.json").write_text(
+            json.dumps(delta_summary, indent=2),
+            encoding="utf-8",
+        )
+
+    print("Saved outputs")
+    print(f"  {output_dir / 'range_profile_zero_doppler.npy'}")
+    print(f"  {output_dir / 'range_doppler_heatmap.npy'}")
+    print(f"  {output_dir / 'nn_logmag_windows.npy'}")
+    print(f"  {output_dir / 'debug_range_profile_slice.png'}")
+    print(f"  {output_dir / 'debug_zero_doppler_profile_avg.png'}")
+    print(f"  {output_dir / 'debug_range_doppler_unshifted.png'}")
+    print(f"  {output_dir / 'debug_range_doppler_shifted.png'}")
+    print(f"  {output_dir / 'target_bin_report.json'}")
+    if delta_vs_open is not None:
+        print(f"  {output_dir / 'delta_vs_open_baseline_logmag.npy'}")
+    if delta_vs_blocked is not None:
+        print(f"  {output_dir / 'delta_vs_blocked_baseline_logmag.npy'}")
+    if delta_vs_open is not None or delta_vs_blocked is not None:
+        print(f"  {output_dir / 'debug_delta_baseline_profiles.png'}")
+        print(f"  {output_dir / 'delta_baseline_summary.json'}")
+    print(f"nn_logmag_windows_shape={tuple(nn_logmag_windows.shape)}")
 
 
 if __name__ == "__main__":
